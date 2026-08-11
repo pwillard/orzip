@@ -6,7 +6,9 @@ It replaces the old FFEDITC compression wrapper without using `ffeditc_unicode.e
 
 References to S1b and S1t refer to the compressed state from a SIMISA perspective, with B representing BINARY (compressed) and T representing  TEXT (uncompressed) 
 
-Typical workflow:
+You can convert individual files or folders
+
+Typical folder workflow:
 
     orzip.exe validate -r --only-s "C:\MSTS\ROUTES\MyRoute\SHAPES"
     orzip.exe roundtrip -r --only-s "C:\MSTS\ROUTES\MyRoute\SHAPES"
