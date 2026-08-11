@@ -8,7 +8,7 @@ References to S1b and S1t refer to the compressed state from a SIMISA perspectiv
 
 You can convert individual files or folders
 
-Typical folder workflow:
+Typical folder workflow: Use the --only-s option with a folder reference to process the S files in a folder.
 
     orzip.exe validate -r --only-s "C:\MSTS\ROUTES\MyRoute\SHAPES"
     orzip.exe roundtrip -r --only-s "C:\MSTS\ROUTES\MyRoute\SHAPES"
