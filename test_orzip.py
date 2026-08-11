@@ -14,13 +14,14 @@ from pathlib import Path
 import orzip
 
 ROOT = Path(__file__).resolve().parent
-COMP_CSX = ROOT / "comp_csx9550.s"
-TEXT_CSX = ROOT / "csx9550.s"
-DASH8_COMP = ROOT / "FFEDIT" / "dash8.s"
-DASH8_TEXT = ROOT / "FFEDIT" / "dash8u.s"
-ACL_WAGON_COMP = ROOT / "ACL66320.s"
-DEPOT_SCENERY_COMP = ROOT / "DEPOT.S"
-CR_GP38_COMPLEX_COMP = ROOT / "CR_GP38-2_8270.s"
+SAMPLE_ROOT = ROOT if (ROOT / "comp_csx9550.s").exists() else ROOT.parent.parent
+COMP_CSX = SAMPLE_ROOT / "comp_csx9550.s"
+TEXT_CSX = SAMPLE_ROOT / "csx9550.s"
+DASH8_COMP = SAMPLE_ROOT / "FFEDIT" / "dash8.s"
+DASH8_TEXT = SAMPLE_ROOT / "FFEDIT" / "dash8u.s"
+ACL_WAGON_COMP = SAMPLE_ROOT / "ACL66320.s"
+DEPOT_SCENERY_COMP = SAMPLE_ROOT / "DEPOT.S"
+CR_GP38_COMPLEX_COMP = SAMPLE_ROOT / "CR_GP38-2_8270.s"
 
 
 class ORZIPRegressionTests(unittest.TestCase):
@@ -140,6 +141,96 @@ class ORZIPRegressionTests(unittest.TestCase):
             roundtrip_text = orzip.decode_text_auto(text_roundtrip.read_bytes())
             self.assertIn("point ( -1.51227999 0.43541801 -7.89935017 )", roundtrip_text)
             self.assertIn("named_shader ( TexDiff )", roundtrip_text)
+
+    def test_cli_compress_and_uncompress_aliases(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="orzip-test-") as td:
+            temp = Path(td)
+            compressed = temp / "csx_from_text.s"
+            text_roundtrip = temp / "csx_roundtrip.s"
+
+            subprocess.run(
+                [sys.executable, str(ROOT / "orzip.py"), "compress", str(TEXT_CSX), "-o", str(compressed)],
+                check=True,
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            detection = orzip.detect_bytes(compressed.read_bytes())
+            self.assertEqual(detection.kind, "compressed")
+            self.assertEqual(detection.declared_length, 671_102)
+
+            subprocess.run(
+                [sys.executable, str(ROOT / "orzip.py"), "uncompress", str(compressed), "-o", str(text_roundtrip)],
+                check=True,
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            roundtrip_text = orzip.decode_text_auto(text_roundtrip.read_bytes())
+            self.assertIn("SIMISA@@@@@@@@@@JINX0s1t______", roundtrip_text)
+            self.assertIn("named_shader ( TexDiff )", roundtrip_text)
+
+    def test_cli_compress_uncompress_default_to_in_place(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="orzip-inplace-test-") as td:
+            temp = Path(td)
+            target = temp / "csx9550.s"
+            shutil.copy2(TEXT_CSX, target)
+
+            subprocess.run(
+                [sys.executable, str(ROOT / "orzip.py"), "compress", str(target)],
+                check=True,
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            compressed_detection = orzip.detect_bytes(target.read_bytes())
+            self.assertEqual(compressed_detection.kind, "compressed")
+            self.assertEqual(compressed_detection.declared_length, 671_102)
+
+            subprocess.run(
+                [sys.executable, str(ROOT / "orzip.py"), "uncompress", str(target)],
+                check=True,
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            roundtrip_text = orzip.decode_text_auto(target.read_bytes())
+            self.assertIn("SIMISA@@@@@@@@@@JINX0s1t______", roundtrip_text)
+            self.assertIn("named_shader ( TexDiff )", roundtrip_text)
+
+    def test_cli_convert_defaults_to_in_place(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="orzip-inplace-test-") as td:
+            temp = Path(td)
+            target = temp / "DEPOT.S"
+            shutil.copy2(DEPOT_SCENERY_COMP, target)
+
+            subprocess.run(
+                [sys.executable, str(ROOT / "orzip.py"), "convert", str(target)],
+                check=True,
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            text = orzip.decode_text_auto(target.read_bytes())
+            self.assertIn("SIMISA@@@@@@@@@@JINX0s1t______", text)
+            self.assertIn("shape (", text)
+
+            subprocess.run(
+                [sys.executable, str(ROOT / "orzip.py"), "convert", str(target)],
+                check=True,
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            detection = orzip.detect_bytes(target.read_bytes())
+            self.assertEqual(detection.kind, "compressed")
+            self.assertEqual(detection.declared_length, 54_161)
 
     def test_cli_convert_auto_detects_binary_and_text_inputs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="orzip-convert-test-") as td:

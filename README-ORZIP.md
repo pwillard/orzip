@@ -57,8 +57,8 @@ python orzip.py validate comp_csx9550.s csx9550.s
 python orzip.py roundtrip comp_csx9550.s csx9550.s
 python orzip.py validate -r --only-s Shapes
 python orzip.py convert -r --only-s Shapes -o ConvertedShapes
-python orzip.py convert comp_csx9550.s -o csx9550_text.s
-python orzip.py convert csx9550.s -o csx9550_compressed.s
+python orzip.py convert comp_csx9550.s
+python orzip.py convert csx9550.s
 python orzip.py unpack comp_csx9550.s -o csx9550.slb
 python orzip.py pack csx9550.slb -o csx9550_repacked.s
 python orzip.py normalize FFEDIT/dash8.s -o dash8_norm.s
@@ -70,14 +70,14 @@ python orzip.py dump-blocks FFEDIT/dash8.s --max-depth 1 --limit 30
 python orzip.py dump-blocks comp_csx9550.s --max-depth 2 --limit 20 --show-gaps
 python orzip.py dump-values comp_csx9550.s --max-depth 4 --item-limit 3
 python orzip.py s1b2s1t comp_csx9550.s -o csx9550_orzip.s
-python orzip.py decompress-text FFEDIT/dash8.s -o dash8_orzip.s
+python orzip.py uncompress FFEDIT/dash8.s -o dash8_orzip.s
 python orzip.py s1t2s1b csx9550.s -o csx9550.slb
 python orzip.py s1t2s1b csx9550.s --compress -o csx9550_compressed.s
-python orzip.py compress-text FFEDIT/dash8u.s -o dash8_compressed.s
+python orzip.py compress FFEDIT/dash8u.s -o dash8_compressed.s
 python test_orzip.py
 ```
 
-Use `--force` to overwrite output files.
+Text/binary conversion commands default to in-place conversion: the filename stays the same and only the file contents change. Pass `-o/--output` when you want a separate output file or folder. Use `--force` to overwrite an explicit output path that already exists.
 
 ## Verified in this folder
 
@@ -94,8 +94,8 @@ Use `--force` to overwrite output files.
 - `s1b2s1t` generated UTF-16 text from both `comp_csx9550.s` and `FFEDIT/dash8.s`.
 - FFEDITC accepted both ORZIP-generated text files, compressed them back to binary, and decompressed those binaries back to UTF-16 text.
 - `s1t2s1b csx9550.s` generated a raw 671,102-byte `JINX0s1b` payload byte-identical to the decompressed payload from `comp_csx9550.s`.
-- `compress-text FFEDIT/dash8u.s` generated a compressed file whose declared decompressed size is 3,440,900 bytes and which ORZIP can convert back to text.
-- `convert` auto-detects binary/compressed input and writes UTF-16 text, or auto-detects text input and writes compressed binary.
+- `compress FFEDIT/dash8u.s` generated a compressed file whose declared decompressed size is 3,440,900 bytes and which ORZIP can convert back to text.
+- `convert` auto-detects binary/compressed input and writes UTF-16 text in place, or auto-detects text input and writes compressed binary in place.
 - `validate` checks compressed/raw/text shape files without writing output.
 - `roundtrip` checks binary -> text -> binary or text -> binary -> text conversion without writing output.
 - `python test_orzip.py` runs the automated regression suite for detection, zlib verification, binary->text rendering, text->binary writing, and CLI compress/decompress smoke coverage.
@@ -117,7 +117,7 @@ The test suite uses only Python's standard library and the sample files in this 
 - `CR_GP38-2_8270.s` renders to text and encodes back to the original binary payload byte-for-byte.
 - binary `comp_csx9550.s` renders to text containing known shape values.
 - `FFEDIT/dash8u.s` encodes to a valid compressed container with the expected declared decompressed size.
-- the CLI can run `compress-text` followed by `decompress-text` on `csx9550.s`.
+- the CLI can run `compress` followed by `uncompress` on `csx9550.s`, defaulting to in-place conversion when no `-o` is supplied.
 - the CLI can run `convert` on compressed binary input and text input.
 - the CLI can run `validate` on compressed binary input and text input, and rejects unsupported files clearly.
 - the CLI can run `roundtrip` on compressed binary input and text input.
@@ -134,7 +134,7 @@ python orzip.py roundtrip -r --only-s Shapes
 python orzip.py detect -r --only-s --verify Shapes
 ```
 
-For recursive conversion, pass an output directory with `-o` and ORZIP preserves the relative folder layout:
+Recursive conversion without `-o` rewrites each `.s` file in place. Pass an output directory with `-o` when you want a separate converted tree; ORZIP then preserves the relative folder layout:
 
 ```bash
 python orzip.py convert -r --only-s Shapes -o ConvertedShapes
@@ -199,19 +199,25 @@ For UTF-16/UTF-8 text shape files it checks:
 
 ## One-command conversion
 
-For normal use, prefer `convert`:
+For normal use, prefer `convert`. Without `-o`, conversion is in-place:
+
+```bash
+python orzip.py convert model.s
+```
+
+It auto-detects the input:
+
+- compressed binary `.s` -> UTF-16 text `s1t`, same filename
+- raw binary `JINX0s1b` payload -> UTF-16 text `s1t`, same filename
+- UTF-16/UTF-8 text `s1t` -> compressed binary `.s`, same filename
+
+Pass `-o` to write a new file instead of replacing the input:
 
 ```bash
 python orzip.py convert model.s -o model_converted.s
 ```
 
-It auto-detects the input:
-
-- compressed binary `.s` -> UTF-16 text `s1t`
-- raw binary `JINX0s1b` payload -> UTF-16 text `s1t`
-- UTF-16/UTF-8 text `s1t` -> compressed binary `.s`
-
-The explicit commands remain available when you need to force a specific layer: `unpack`, `pack`, `s1b2s1t`, `s1t2s1b`, `compress-text`, and `decompress-text`.
+The explicit commands remain available when you need to force a specific layer: `unpack`, `pack`, `s1b2s1t`, `s1t2s1b`, `compress`, and `uncompress`. The older names `compress-text` and `decompress-text` are still accepted as compatibility aliases.
 
 ## Current `dump-blocks` limitation
 

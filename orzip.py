@@ -653,7 +653,14 @@ def convert_output_path(path: Path, args: argparse.Namespace, suffix: str) -> Pa
     if args.output:
         rel = relative_to_input_roots(path, args.inputs)
         return args.output / rel.with_suffix(rel.suffix + suffix)
-    return path.with_suffix(path.suffix + suffix)
+    return path
+
+
+def is_same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return left.absolute() == right.absolute()
 
 
 def cmd_detect(args: argparse.Namespace) -> int:
@@ -716,8 +723,8 @@ def cmd_s1b2s1t(args: argparse.Namespace) -> int:
         payload = extract_binary_payload(_read(p))
         text = render_s1t_from_payload(payload, orzip_defs)
         output_bytes = UTF16LE_BOM + text.encode("utf-16le")
-        out = args.output if len(args.inputs) == 1 and not p.is_dir() and args.output else p.with_suffix(p.suffix + ".s1t.s")
-        _write(out, output_bytes, args.force)
+        out = args.output if len(args.inputs) == 1 and not p.is_dir() and args.output else p
+        _write(out, output_bytes, args.force or is_same_path(out, p))
         print(f"[s1b2s1t] {p} -> {out} ({len(output_bytes)} bytes)")
     return 0
 
@@ -732,13 +739,8 @@ def cmd_s1t2s1b(args: argparse.Namespace) -> int:
         root = parse_s1t_text(decode_text_auto(_read(p)))
         payload = encode_s1t_node(root, orzip_defs)
         data = zlib_compress_container(payload, args.level) if args.compress else payload
-        if len(args.inputs) == 1 and not p.is_dir() and args.output:
-            out = args.output
-        elif args.compress:
-            out = p.with_suffix(p.suffix + ".compressed.s")
-        else:
-            out = p.with_suffix(p.suffix + ".s1b")
-        _write(out, data, args.force)
+        out = args.output if len(args.inputs) == 1 and not p.is_dir() and args.output else p
+        _write(out, data, args.force or is_same_path(out, p))
         mode = "compressed" if args.compress else "raw"
         print(f"[s1t2s1b] {p} -> {out} ({mode}, {len(data)} bytes)")
     return 0
@@ -759,14 +761,14 @@ def cmd_convert(args: argparse.Namespace) -> int:
             text = render_s1t_from_payload(payload, orzip_defs)
             output_data = UTF16LE_BOM + text.encode("utf-16le")
             out = convert_output_path(p, args, ".s1t.s")
-            _write(out, output_data, args.force)
+            _write(out, output_data, args.force or is_same_path(out, p))
             print(f"[convert] {p} -> {out} (binary -> text, {len(output_data)} bytes)")
         elif det.kind in {"unicode-text", "ascii-or-unwrapped"}:
             root = parse_s1t_text(decode_text_auto(data))
             payload = encode_s1t_node(root, orzip_defs)
             output_data = zlib_compress_container(payload, args.level)
             out = convert_output_path(p, args, ".compressed.s")
-            _write(out, output_data, args.force)
+            _write(out, output_data, args.force or is_same_path(out, p))
             print(f"[convert] {p} -> {out} (text -> compressed binary, {len(output_data)} bytes)")
         else:
             raise ORZIPError(f"convert cannot auto-convert {p}: {det.detail}")
@@ -1130,6 +1132,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="overwrite output files")
     p.set_defaults(func=cmd_s1b2s1t)
 
+    p = sub.add_parser("uncompress", help="alias for decompress-text")
+    add_common(p)
+    p.add_argument("-o", "--output", type=Path, help="output path for a single input")
+    p.add_argument("--force", action="store_true", help="overwrite output files")
+    p.set_defaults(func=cmd_s1b2s1t)
+
     p = sub.add_parser("s1t2s1b", help="convert UTF-16/UTF-8 text s1t shape data to binary s1b")
     add_common(p)
     p.add_argument("-o", "--output", type=Path, help="output path for a single input")
@@ -1139,6 +1147,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_s1t2s1b)
 
     p = sub.add_parser("compress-text", help="text s1t -> compressed SIMISA@F .s")
+    add_common(p)
+    p.add_argument("-o", "--output", type=Path, help="output path for a single input")
+    p.add_argument("--force", action="store_true", help="overwrite output files")
+    p.add_argument("--level", type=int, default=9, choices=range(0, 10), metavar="0-9", help="zlib compression level (default: 9)")
+    p.set_defaults(func=cmd_s1t2s1b, compress=True)
+
+    p = sub.add_parser("compress", help="alias for compress-text")
     add_common(p)
     p.add_argument("-o", "--output", type=Path, help="output path for a single input")
     p.add_argument("--force", action="store_true", help="overwrite output files")
