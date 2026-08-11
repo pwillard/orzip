@@ -15,3 +15,5 @@ Typical folder workflow: Use the --only-s option with a folder reference to proc
     orzip.exe convert -r --only-s "C:\MSTS\ROUTES\MyRoute\SHAPES"
 
 Important: because convert is now in-place by default, make a backup first if you are converting the original MSTS/Open Rails folders directly.
+
+NOTE: This is a barely tested piece of code cobbled together in an afternoon.  It may fail spectacularly.  You have been warned.
