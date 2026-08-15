@@ -197,6 +197,10 @@ def parse_grammar_items(tokens: tuple[str, ...]) -> list[tuple]:
                 subitems, index = parse_until(index + 1, "}")
                 items.append(("repeat", subitems))
                 continue
+            if token == "|":
+                items.append(("choice",))
+                index += 1
+                continue
             if token == ":" and index + 1 < len(tokens):
                 field_type = tokens[index + 1]
                 field_name = field_type
@@ -214,6 +218,59 @@ def parse_grammar_items(tokens: tuple[str, ...]) -> list[tuple]:
 
     items, _ = parse_until(0)
     return items
+
+
+def grammar_alternative_items(items: list[tuple]) -> list[list[tuple]]:
+    """Expand a flat grammar group containing | choices into alternatives.
+
+    Locomotive animation files can use a repeated group like
+    `{ :tcb_key | :slerp_rot }`.  Splitting the already-tokenized group at
+    choice markers lets the decoder/encoder select whichever keyed block is
+    actually present without changing rules that do not use alternatives.
+    """
+    alternatives: list[list[tuple]] = [[]]
+    for item in items:
+        if item[0] == "choice":
+            alternatives.append([])
+            continue
+        alternatives[-1].append(item)
+    return alternatives
+
+
+def items_start_with_matching_node(items: list[tuple], node: SExprNode, defs_module) -> bool:
+    if not items:
+        return False
+    first = items[0]
+    while first[0] in {"optional", "repeat"} and first[1]:
+        if first[0] == "repeat":
+            return any(items_start_with_matching_node(alt, node, defs_module) for alt in grammar_alternative_items(first[1]))
+        first = first[1][0]
+    return first[0] == "field" and first[1] not in PRIMITIVE_TYPES and block_matches_expected(node.name, first[1], defs_module)
+
+
+def items_start_with_matching_block(payload: bytes, pos: int, end: int, items: list[tuple], defs_module) -> bool:
+    if pos >= end or not items:
+        return False
+    first = items[0]
+    while first[0] in {"optional", "repeat"} and first[1]:
+        if first[0] == "repeat":
+            return any(items_start_with_matching_block(payload, pos, end, alt, defs_module) for alt in grammar_alternative_items(first[1]))
+        first = first[1][0]
+    if first[0] != "field" or first[1] in PRIMITIVE_TYPES:
+        return False
+    child = parse_binary_block(payload, pos, defs_module.core_token_name)
+    return child is not None and child.end <= end and block_matches_expected(child.token_name, first[1], defs_module)
+
+
+def items_start_with_primitive(items: list[tuple]) -> bool:
+    if not items:
+        return False
+    first = items[0]
+    while first[0] in {"optional", "repeat"} and first[1]:
+        if first[0] == "repeat":
+            return any(items_start_with_primitive(alt) for alt in grammar_alternative_items(first[1]))
+        first = first[1][0]
+    return first[0] == "field" and first[1] in PRIMITIVE_TYPES
 
 
 def choice_names(rule_name: str, defs_module) -> set[str]:
@@ -240,6 +297,11 @@ def optional_group_present(payload: bytes, pos: int, end: int, subitems: list[tu
         return False
     first = subitems[0]
     while first[0] in {"optional", "repeat"} and first[1]:
+        if first[0] == "repeat":
+            alternatives = grammar_alternative_items(first[1])
+            if any(items_start_with_primitive(alt) for alt in alternatives):
+                return pos < end
+            return any(items_start_with_matching_block(payload, pos, end, alt, defs_module) for alt in alternatives)
         first = first[1][0]
     if first[0] != "field":
         return False
@@ -340,7 +402,12 @@ def render_s1t_from_payload(payload: bytes, defs_module) -> str:
                 repeated = 0
                 while pos < end and (total is None or repeated < total):
                     before = pos
-                    subentries, pos = decode_entries(item[1], pos, end, counts.copy())
+                    alternatives = grammar_alternative_items(item[1])
+                    chosen = next(
+                        (alt for alt in alternatives if items_start_with_matching_block(payload, pos, end, alt, defs_module)),
+                        alternatives[0],
+                    )
+                    subentries, pos = decode_entries(chosen, pos, end, counts.copy())
                     entries.extend(subentries)
                     if pos == before:
                         break
@@ -555,6 +622,15 @@ def encode_s1t_node(root: SExprNode, defs_module) -> bytes:
                 present = True
                 if first and first[0] == "field" and first[1] not in PRIMITIVE_TYPES:
                     present = isinstance(node.items[index], SExprNode) and node_matches_expected(node.items[index], first[1])
+                elif first and first[0] == "repeat":
+                    alternatives = grammar_alternative_items(first[1])
+                    if any(items_start_with_primitive(alt) for alt in alternatives):
+                        present = not isinstance(node.items[index], SExprNode)
+                    else:
+                        present = isinstance(node.items[index], SExprNode) and any(
+                            items_start_with_matching_node(alt, node.items[index], defs_module)
+                            for alt in alternatives
+                        )
                 if present:
                     subbytes, index = encode_items(node, subitems, index, counts.copy())
                     out.extend(subbytes)
@@ -563,7 +639,17 @@ def encode_s1t_node(root: SExprNode, defs_module) -> bytes:
                 total = next(reversed(counts.values())) if counts else None
                 repeated = 0
                 while index < len(node.items) and (total is None or repeated < total):
-                    subbytes, new_index = encode_items(node, subitems, index, counts.copy())
+                    alternatives = grammar_alternative_items(subitems)
+                    current = node.items[index]
+                    chosen = next(
+                        (
+                            alt
+                            for alt in alternatives
+                            if isinstance(current, SExprNode) and items_start_with_matching_node(alt, current, defs_module)
+                        ),
+                        alternatives[0],
+                    )
+                    subbytes, new_index = encode_items(node, chosen, index, counts.copy())
                     if new_index == index:
                         break
                     out.extend(subbytes)
@@ -653,14 +739,7 @@ def convert_output_path(path: Path, args: argparse.Namespace, suffix: str) -> Pa
     if args.output:
         rel = relative_to_input_roots(path, args.inputs)
         return args.output / rel.with_suffix(rel.suffix + suffix)
-    return path
-
-
-def is_same_path(left: Path, right: Path) -> bool:
-    try:
-        return left.resolve() == right.resolve()
-    except OSError:
-        return left.absolute() == right.absolute()
+    return path.with_suffix(path.suffix + suffix)
 
 
 def cmd_detect(args: argparse.Namespace) -> int:
@@ -723,8 +802,8 @@ def cmd_s1b2s1t(args: argparse.Namespace) -> int:
         payload = extract_binary_payload(_read(p))
         text = render_s1t_from_payload(payload, orzip_defs)
         output_bytes = UTF16LE_BOM + text.encode("utf-16le")
-        out = args.output if len(args.inputs) == 1 and not p.is_dir() and args.output else p
-        _write(out, output_bytes, args.force or is_same_path(out, p))
+        out = args.output if len(args.inputs) == 1 and not p.is_dir() and args.output else p.with_suffix(p.suffix + ".s1t.s")
+        _write(out, output_bytes, args.force)
         print(f"[s1b2s1t] {p} -> {out} ({len(output_bytes)} bytes)")
     return 0
 
@@ -739,8 +818,13 @@ def cmd_s1t2s1b(args: argparse.Namespace) -> int:
         root = parse_s1t_text(decode_text_auto(_read(p)))
         payload = encode_s1t_node(root, orzip_defs)
         data = zlib_compress_container(payload, args.level) if args.compress else payload
-        out = args.output if len(args.inputs) == 1 and not p.is_dir() and args.output else p
-        _write(out, data, args.force or is_same_path(out, p))
+        if len(args.inputs) == 1 and not p.is_dir() and args.output:
+            out = args.output
+        elif args.compress:
+            out = p.with_suffix(p.suffix + ".compressed.s")
+        else:
+            out = p.with_suffix(p.suffix + ".s1b")
+        _write(out, data, args.force)
         mode = "compressed" if args.compress else "raw"
         print(f"[s1t2s1b] {p} -> {out} ({mode}, {len(data)} bytes)")
     return 0
@@ -761,14 +845,14 @@ def cmd_convert(args: argparse.Namespace) -> int:
             text = render_s1t_from_payload(payload, orzip_defs)
             output_data = UTF16LE_BOM + text.encode("utf-16le")
             out = convert_output_path(p, args, ".s1t.s")
-            _write(out, output_data, args.force or is_same_path(out, p))
+            _write(out, output_data, args.force)
             print(f"[convert] {p} -> {out} (binary -> text, {len(output_data)} bytes)")
         elif det.kind in {"unicode-text", "ascii-or-unwrapped"}:
             root = parse_s1t_text(decode_text_auto(data))
             payload = encode_s1t_node(root, orzip_defs)
             output_data = zlib_compress_container(payload, args.level)
             out = convert_output_path(p, args, ".compressed.s")
-            _write(out, output_data, args.force or is_same_path(out, p))
+            _write(out, output_data, args.force)
             print(f"[convert] {p} -> {out} (text -> compressed binary, {len(output_data)} bytes)")
         else:
             raise ORZIPError(f"convert cannot auto-convert {p}: {det.detail}")
@@ -1087,7 +1171,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="orzip.py",
         description="Standalone MSTS/Open Rails SIMISA zlib compressor/decompressor for compressed binary .s containers.",
     )
-    parser.add_argument("--version", action="version", version="ORZIP 1.0")
+    parser.add_argument("--version", action="version", version="ORZIP 1.0.2")
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_common(sp: argparse.ArgumentParser) -> None:
@@ -1132,12 +1216,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="overwrite output files")
     p.set_defaults(func=cmd_s1b2s1t)
 
-    p = sub.add_parser("uncompress", help="alias for decompress-text")
-    add_common(p)
-    p.add_argument("-o", "--output", type=Path, help="output path for a single input")
-    p.add_argument("--force", action="store_true", help="overwrite output files")
-    p.set_defaults(func=cmd_s1b2s1t)
-
     p = sub.add_parser("s1t2s1b", help="convert UTF-16/UTF-8 text s1t shape data to binary s1b")
     add_common(p)
     p.add_argument("-o", "--output", type=Path, help="output path for a single input")
@@ -1147,13 +1225,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_s1t2s1b)
 
     p = sub.add_parser("compress-text", help="text s1t -> compressed SIMISA@F .s")
-    add_common(p)
-    p.add_argument("-o", "--output", type=Path, help="output path for a single input")
-    p.add_argument("--force", action="store_true", help="overwrite output files")
-    p.add_argument("--level", type=int, default=9, choices=range(0, 10), metavar="0-9", help="zlib compression level (default: 9)")
-    p.set_defaults(func=cmd_s1t2s1b, compress=True)
-
-    p = sub.add_parser("compress", help="alias for compress-text")
     add_common(p)
     p.add_argument("-o", "--output", type=Path, help="output path for a single input")
     p.add_argument("--force", action="store_true", help="overwrite output files")
