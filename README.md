@@ -18,3 +18,7 @@ In-place conversion creates versioned backups beside each source file (`model.s.
 Advanced users can add `--no-backup` to an in-place `convert`, `text`, or `binary` command. Replacement remains atomic, but the previous file contents are not retained.
 
 Run `orzip.exe --help` for the concise command list or `orzip.exe --advanced-help` for compatibility and technical aliases. See `USER_GUIDE.md` for normal workflows and `README-ORZIP.md` for format and developer details.
+
+# NOTE
+
+This update removes some extra functions that likely would never be used and adds extra functionality, such as making backup copies. These are breaking changes and will cause older versions of SFM3 to fail.
