@@ -1,4 +1,4 @@
-# ORZIP
+# ORZIP 1.0.3
 
 ORZIP is a standalone modern Python tool for the MSTS/Open Rails `SIMISA@F` compressed-binary container used by `.s` shape files.
 
@@ -11,12 +11,16 @@ It replaces the old FFEDITC compression wrapper without using `ffeditc_unicode.e
 - Unpack compressed `SIMISA@F` files to raw `JINX0...` binary payloads.
 - Pack raw `JINX0...` binary payloads back into MSTS-compatible `SIMISA@F` compressed files.
 - Normalize/repack existing compressed files with modern zlib.
-- Batch folder processing with `-r`.
+- Batch folder processing with `-r` and `.s` filtering with `-s/--only-s`.
+- Atomic in-place replacement with versioned backups.
+- Mirrored output trees for directory and multiple-file conversion.
+- Preflight protection against output/output, output/input, symlink, and hard-link collisions.
+- Strict zlib validation, including truncation, trailing-data, and declared-length checks.
 - Inspect embedded MSTS/FFEDIT token and shape grammar definitions with `defs`.
-- Dump binary `s1b` block headers/hierarchy from compressed or raw files with `dump-blocks`.
-- Decode binary `s1b` block contents into grammar-named values with `dump-values`.
-- Export compressed/raw binary `s1b` shape data to UTF-16 textual `s1t` files with `s1b2s1t` / `decompress-text`.
-- Convert textual `s1t` shape files back to raw or compressed binary `s1b` with `s1t2s1b` / `compress-text`.
+- Dump binary `s1b` block headers/hierarchy from compressed or raw files with `blocks`.
+- Decode binary `s1b` block contents into grammar-named values with `values`.
+- Export compressed/raw binary `s1b` shape data to UTF-16 textual `s1t` files with `text`.
+- Convert textual `s1t` shape files back to compressed binary `.s` files with `binary`.
 
 ## Important format note
 
@@ -27,13 +31,13 @@ FFEDITC does two different jobs:
 2. token/grammar conversion:
    binary/tokenized `s1b` <-> textual UTF-16 `s1t`
 
-This version of ORZIP replaces job 1. It deliberately does not pretend that zlib unpacking is the same thing as FFEDITC's `s1b` <-> `s1t` token conversion.
+ORZIP implements both jobs for the supported shape grammar. The low-level `raw`, `wrap`, and `repack` commands operate on the container layer; `text`, `binary`, and `convert` also perform grammar-guided `s1b`/`s1t` conversion.
 
-The local verification proves that ORZIP-repacked `.s` files remain acceptable to FFEDITC for text conversion.
+ORZIP's text formatting is normalized and is not intended to reproduce FFEDITC whitespace byte-for-byte. Binary -> text -> binary tests compare the raw binary payload when byte-exact verification is possible.
 
 ## Embedded definitions
 
-`orzip_defs.py` embeds the first definition layer needed for full `s1b` <-> `s1t` conversion:
+`orzip_defs.py` embeds the token and grammar definitions used for `s1b` <-> `s1t` conversion:
 
 - 283 core token names from `coreids.tok`, with numeric lookup.
 - 1,240 expanded app/form/load-string token names from `appids.tok`, `forms.hdr`, and `loadstr.hdr`.
@@ -52,53 +56,32 @@ named_shader = 129
 ## Examples
 
 ```bash
-python orzip.py detect --verify comp_csx9550.s FFEDIT/dash8.s
-python orzip.py validate comp_csx9550.s csx9550.s
-python orzip.py roundtrip comp_csx9550.s csx9550.s
-python orzip.py validate -r --only-s Shapes
-python orzip.py convert -r --only-s Shapes -o ConvertedShapes
-python orzip.py convert comp_csx9550.s
-python orzip.py convert csx9550.s
-python orzip.py unpack comp_csx9550.s -o csx9550.slb
-python orzip.py pack csx9550.slb -o csx9550_repacked.s
-python orzip.py normalize FFEDIT/dash8.s -o dash8_norm.s
-python orzip.py detect -r --verify FFEDIT
+python orzip.py info --verify model.s
+python orzip.py check model.s model_text.s
+python orzip.py test model.s model_text.s
+python orzip.py check -r -s Shapes
+python orzip.py convert -r -s Shapes -o ConvertedShapes
+python orzip.py convert model.s
+python orzip.py raw model.s -o model.s1b
+python orzip.py wrap model.s1b -o model_wrapped.s
+python orzip.py repack model.s -o model_repacked.s
 python orzip.py defs
 python orzip.py defs --token shape
 python orzip.py defs --grammar points
-python orzip.py dump-blocks FFEDIT/dash8.s --max-depth 1 --limit 30
-python orzip.py dump-blocks comp_csx9550.s --max-depth 2 --limit 20 --show-gaps
-python orzip.py dump-values comp_csx9550.s --max-depth 4 --item-limit 3
-python orzip.py s1b2s1t comp_csx9550.s -o csx9550_orzip.s
-python orzip.py uncompress FFEDIT/dash8.s -o dash8_orzip.s
-python orzip.py s1t2s1b csx9550.s -o csx9550.slb
-python orzip.py s1t2s1b csx9550.s --compress -o csx9550_compressed.s
-python orzip.py compress FFEDIT/dash8u.s -o dash8_compressed.s
+python orzip.py blocks model.s --max-depth 2 --limit 20 --show-gaps
+python orzip.py values model.s --max-depth 4 --item-limit 3
+python orzip.py text model.s -o model_text.s
+python orzip.py binary model_text.s -o model_binary.s
 python test_orzip.py
 ```
 
-Text/binary conversion commands default to in-place conversion: the filename stays the same and only the file contents change. Pass `-o/--output` when you want a separate output file or folder. Use `--force` to overwrite an explicit output path that already exists.
+Without `-o`, `convert`, `text`, and `binary` operate in place. ORZIP writes and synchronizes a same-directory temporary file, publishes a versioned backup (`model.s.bak`, then `.bak.1`, `.bak.2`, and so on), and atomically replaces the source. A failed write or replacement leaves the original intact. The explicit `--no-backup` option skips backup creation but still uses the temporary file and atomic replacement; after a successful replacement, the previous contents are not recoverable through ORZIP.
 
-## Verified in this folder
+For `convert`, `text`, `binary`, and their technical aliases, one explicit input file makes `-o` an output file. With multiple files or directory input, `-o` is an output directory; ORZIP appends `.s1t.s`, `.compressed.s`, or `.s1b` as appropriate and preserves relative directories. Planned outputs are checked before writing so `--force` cannot overwrite another input or collapse colliding outputs.
 
-- `comp_csx9550.s` inflates to a 671,102-byte raw `JINX0s1b` payload.
-- Repacking and unpacking that payload gives an identical SHA-256 hash.
-- `FFEDIT/dash8.s` inflates to a 3,440,900-byte raw `JINX0s1b` payload.
-- `ACL66320.s` inflates to a 1,313,974-byte raw `JINX0s1b` wagon-shape payload and round-trips binary -> text -> binary byte-exactly.
-- `DEPOT.S` inflates to a 54,161-byte raw `JINX0s1b` scenery-shape payload and round-trips binary -> text -> binary byte-exactly.
-- `CR_GP38-2_8270.s` inflates to a 5,757,584-byte raw `JINX0s1b` complex locomotive-shape payload and round-trips binary -> text -> binary byte-exactly.
-- An ORZIP-normalized `dash8.s` was accepted by `ffeditc_unicode.exe` and converted to UTF-16 text identical to `FFEDIT/dash8u.s`.
-- `dump-blocks` identifies the root `shape` block and expected top-level shape children in both `FFEDIT/dash8.s` and `comp_csx9550.s`.
-- `dump-values` decodes named primitive fields for core shape structures, including shape headers, volume spheres, shader/filter names, points, UV points, normals, matrices, images, textures, vertex states, primitive states, LOD controls, and animations.
-- The first decoded point from `comp_csx9550.s` matches the first text point in `csx9550.s`: `-1.51228 0.435418 -7.89935`.
-- `s1b2s1t` generated UTF-16 text from both `comp_csx9550.s` and `FFEDIT/dash8.s`.
-- FFEDITC accepted both ORZIP-generated text files, compressed them back to binary, and decompressed those binaries back to UTF-16 text.
-- `s1t2s1b csx9550.s` generated a raw 671,102-byte `JINX0s1b` payload byte-identical to the decompressed payload from `comp_csx9550.s`.
-- `compress FFEDIT/dash8u.s` generated a compressed file whose declared decompressed size is 3,440,900 bytes and which ORZIP can convert back to text.
-- `convert` auto-detects binary/compressed input and writes UTF-16 text in place, or auto-detects text input and writes compressed binary in place.
-- `validate` checks compressed/raw/text shape files without writing output.
-- `roundtrip` checks binary -> text -> binary or text -> binary -> text conversion without writing output.
-- `python test_orzip.py` runs the automated regression suite for detection, zlib verification, binary->text rendering, text->binary writing, and CLI compress/decompress smoke coverage.
+## Validation and safety
+
+For compressed files, `check` verifies the SIMISA header, complete zlib stream consumption, absence of trailing data, declared payload length, binary header, root block, and grammar decode. Text input is parsed and grammar-encoded without writing output. Malformed values, unterminated strings, excessive nesting, and expected filesystem failures are reported as concise ORZIP errors rather than Python tracebacks.
 
 ## Regression tests
 
@@ -108,56 +91,71 @@ Run:
 python test_orzip.py
 ```
 
-The test suite uses only Python's standard library and the sample files in this folder. It verifies:
+The source-only suite generates a minimal valid shape in the operating-system temporary directory. It covers container integrity, text/binary conversion, atomic backups, output planning and collision protection, mirrored directories, CLI behavior, and malformed-input errors without storing sample shapes in Git.
 
-- `comp_csx9550.s` and `FFEDIT/dash8.s` are detected as compressed and inflate to the expected raw payload sizes.
-- `csx9550.s` encodes back to a raw binary payload byte-identical to the inflated payload from `comp_csx9550.s`.
-- `ACL66320.s` renders to text and encodes back to the original binary payload byte-for-byte.
-- `DEPOT.S` renders to text and encodes back to the original binary payload byte-for-byte.
-- `CR_GP38-2_8270.s` renders to text and encodes back to the original binary payload byte-for-byte.
-- binary `comp_csx9550.s` renders to text containing known shape values.
-- `FFEDIT/dash8u.s` encodes to a valid compressed container with the expected declared decompressed size.
-- the CLI can run `compress` followed by `uncompress` on `csx9550.s`, defaulting to in-place conversion when no `-o` is supplied.
-- the CLI can run `convert` on compressed binary input and text input.
-- the CLI can run `validate` on compressed binary input and text input, and rejects unsupported files clearly.
-- the CLI can run `roundtrip` on compressed binary input and text input.
-- recursive folder processing can be limited to `.s`/`.S` files with `--only-s`.
-- recursive `convert` can mirror a folder tree under an output directory.
+Four optional integration tests run when these ignored local files exist:
+
+- `samples/dash8.s`
+- `samples/dash8u.s`
+- `samples/275004_KN.s`
+- `samples/275004_LN.s`
+
+The optional tests are the external compatibility oracle for larger real-world payloads. When those files are absent, the four tests are reported as skipped; the source-only suite still runs. The repository intentionally tracks no sample `.s` files.
+
+## Building Windows release artifacts
+
+From Command Prompt, install the pinned build dependencies and run the complete release build:
+
+```text
+python -m pip install -r requirements-build.txt
+build_release.bat
+```
+
+This builds `DIST\orzip.exe` with PyInstaller, renders `USER_GUIDE.md` as `DIST\DOCS\ORZIP_EXE_User_Guide.pdf` with ReportLab, copies the current source documentation, and rewrites `DIST\SHA256SUMS.txt`. The checksum writer requires exactly the six documented release files and rejects missing or unexpected artifacts.
+
+The individual build entry points are:
+
+```text
+build_orzip_exe.bat
+build_user_guide_pdf.bat
+```
+
+Both builders generate through temporary artifacts before replacing the final output. If a final EXE or PDF is open or locked, the script reports the fresh temporary artifact instead of discarding it. The PDF uses deterministic metadata and built-in fonts; the EXE build sets a fixed source epoch and Python hash seed. With the pinned dependencies, consecutive clean builds in the same supported environment produce stable hashes.
 
 ## Folder processing
 
-Most commands accept directories as inputs. Use `-r` to recurse and `--only-s` to ignore non-shape files:
+Most commands accept directories as inputs. Use `-r` to recurse and `-s/--only-s` to ignore non-shape files:
 
 ```bash
-python orzip.py validate -r --only-s Shapes
-python orzip.py roundtrip -r --only-s Shapes
-python orzip.py detect -r --only-s --verify Shapes
+python orzip.py check -r -s Shapes
+python orzip.py test -r -s Shapes
+python orzip.py info -r -s --verify Shapes
 ```
 
-Recursive conversion without `-o` rewrites each `.s` file in place. Pass an output directory with `-o` when you want a separate converted tree; ORZIP then preserves the relative folder layout:
+Recursive conversion without `-o` converts each `.s` file in place using atomic replacement and a versioned backup. Pass an output directory with `-o` when you want a separate converted tree; ORZIP preserves the relative folder layout:
 
 ```bash
-python orzip.py convert -r --only-s Shapes -o ConvertedShapes
+python orzip.py convert -r -s Shapes -o ConvertedShapes
 ```
 
 Example:
 
 ```text
-Shapes/DEPOT.S
-Shapes/Nested/ACL66320.s
+Shapes/model.S
+Shapes/Nested/building.s
 
-ConvertedShapes/DEPOT.S.s1t.s
-ConvertedShapes/Nested/ACL66320.s.s1t.s
+ConvertedShapes/model.S.s1t.s
+ConvertedShapes/Nested/building.s.s1t.s
 ```
 
-Without `--only-s`, recursive commands inspect every file in the folder tree.
+Without `-s/--only-s`, recursive commands inspect every file in the folder tree. If the output directory is nested under a recursive input directory, ORZIP excludes that output subtree from input discovery. The output directory cannot be identical to an input directory.
 
 ## Round-trip checks
 
-Use `roundtrip` to verify that ORZIP can convert a file through the opposite representation without writing output:
+Use `test` to verify that ORZIP can convert a file through the opposite representation without writing output:
 
 ```bash
-python orzip.py roundtrip comp_csx9550.s csx9550.s
+python orzip.py test model.s model_text.s
 ```
 
 For compressed/raw binary shape files it performs:
@@ -178,15 +176,15 @@ and reports that the regenerated text is parseable. Text formatting may differ f
 
 ## Validation
 
-Use `validate` to check files without producing converted output:
+Use `check` to check files without producing converted output:
 
 ```bash
-python orzip.py validate comp_csx9550.s csx9550.s
+python orzip.py check model.s model_text.s
 ```
 
 For compressed/raw binary shape files it checks:
 
-- zlib/container integrity and declared payload size when compressed
+- complete zlib stream, no trailing data, and declared payload size when compressed
 - `JINX0s1b` binary payload header
 - root binary block parses as `shape`
 - grammar-guided binary decode succeeds
@@ -217,14 +215,14 @@ Pass `-o` to write a new file instead of replacing the input:
 python orzip.py convert model.s -o model_converted.s
 ```
 
-The explicit commands remain available when you need to force a specific layer: `unpack`, `pack`, `s1b2s1t`, `s1t2s1b`, `compress`, and `uncompress`. The older names `compress-text` and `decompress-text` are still accepted as compatibility aliases.
+The explicit commands remain available when you need to force a specific layer: `text`, `binary`, `raw`, `wrap`, and `repack`. Run `python orzip.py --advanced-help` to see the compatibility and technical command names such as `s1b2s1t` and `s1t2s1b`.
 
-## Current `dump-blocks` limitation
+## Inspection and conversion notes
 
-`dump-blocks` is a structural block-header inspector, not a full grammar decoder yet. It scans block boundaries and uses the embedded token table to name blocks. With `--show-gaps`, primitive data such as counts and floats appears as `<data>` gaps. The next step is to replace scanning with grammar-guided field decoding so those gaps become named values like `num_points`, `pX`, `pY`, and `pZ`.
+`blocks` is a structural block-header inspector. It scans block boundaries and uses the embedded token table to name blocks; primitive data may appear as `<data>` gaps when `--show-gaps` is enabled.
 
-`dump-values` is the first grammar-guided decoder. It is intended for inspection and parser development, not final `.s` text export yet. It limits repeated lists by default with `--item-limit` so huge arrays such as `points`, `uv_points`, and `normals` do not flood the terminal. Use `--item-limit -1` only when you intentionally want complete output.
+`values` is the grammar-guided value inspector. It limits repeated lists by default so large point, UV, and normal arrays do not flood the terminal. Use `--item-limit -1` only when complete output is intentional.
 
-`s1b2s1t` is the first full text exporter. It is now good enough for FFEDITC to read the generated text for the tested files, but its formatting is ORZIP's own clean S-expression style rather than byte-for-byte FFEDITC formatting. This is expected: whitespace and some string quoting are not semantically important. ORZIP emits enough float precision for tested ORZIP-generated text to encode back to the original float32 payload bytes.
+`text` is the full text exporter and emits normalized S-expression formatting. `binary` is the grammar-guided compressed binary writer. Whitespace and quoting may differ from other tools, and rounded float text can produce a structurally valid binary file that is not byte-identical to an earlier binary source.
 
-`s1t2s1b` is the first grammar-guided binary writer. It round-trips the provided `csx9550.s` exactly to the original binary payload. Some text files produced by FFEDITC may contain rounded float values, so converting those back to binary can be structurally valid without being byte-identical to the original binary source.
+Text nesting is limited to 256 blocks so malformed input cannot exhaust Python recursion. ORZIP does not catch unexpected programming exceptions broadly; expected file, format, and value errors receive concise messages, while genuine implementation defects remain visible during development.

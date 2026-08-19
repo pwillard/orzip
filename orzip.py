@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
+import shutil
 import struct
 import sys
+import tempfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +31,7 @@ UNCOMPRESSED_ASCII_MAGIC = b"SIMISA@@"
 UTF16LE_BOM = b"\xff\xfe"
 UTF16LE_SIMISA = UTF16LE_BOM + "SIMISA".encode("utf-16le")
 ZLIB_MAGIC_PREFIXES = {b"\x78\x01", b"\x78\x5e", b"\x78\x9c", b"\x78\xda"}
+MAX_S1T_NESTING = 256
 
 
 class ORZIPError(Exception):
@@ -72,11 +76,87 @@ def _read(path: Path) -> bytes:
 def _write(path: Path, data: bytes, force: bool) -> None:
     if path.exists() and not force:
         raise ORZIPError(f"refusing to overwrite existing file: {path} (use --force)")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ORZIPError(f"cannot create output directory {path.parent}: {exc}") from exc
     try:
         path.write_bytes(data)
     except OSError as exc:
         raise ORZIPError(f"cannot write {path}: {exc}") from exc
+
+
+def _best_effort_unlink(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _create_versioned_backup(path: Path) -> Path:
+    temp_path: Path | None = None
+    try:
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.backup.", suffix=".tmp", dir=path.parent)
+        temp_path = Path(temp_name)
+        with os.fdopen(fd, "wb") as destination:
+            with path.open("rb") as source:
+                shutil.copyfileobj(source, destination)
+                destination.flush()
+                os.fsync(destination.fileno())
+        shutil.copystat(path, temp_path)
+
+        index = 0
+        while True:
+            suffix = ".bak" if index == 0 else f".bak.{index}"
+            backup = path.with_name(path.name + suffix)
+            if backup.exists():
+                index += 1
+                continue
+            os.replace(temp_path, backup)
+            return backup
+    except OSError:
+        _best_effort_unlink(temp_path)
+        raise
+
+
+def atomic_write_in_place(path: Path, data: bytes, create_backup: bool = True) -> None:
+    if not path.is_file():
+        raise ORZIPError(f"cannot replace missing input file: {path}")
+
+    temp_path: Path | None = None
+    backup_path: Path | None = None
+    try:
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        temp_path = Path(temp_name)
+        with os.fdopen(fd, "wb") as destination:
+            destination.write(data)
+            destination.flush()
+            os.fsync(destination.fileno())
+    except OSError as exc:
+        _best_effort_unlink(temp_path)
+        raise ORZIPError(f"cannot prepare replacement for {path}: {exc}") from exc
+
+    try:
+        shutil.copymode(path, temp_path)
+    except OSError as exc:
+        _best_effort_unlink(temp_path)
+        raise ORZIPError(f"cannot preserve mode for {path}: {exc}") from exc
+
+    if create_backup:
+        try:
+            backup_path = _create_versioned_backup(path)
+        except OSError as exc:
+            _best_effort_unlink(temp_path)
+            raise ORZIPError(f"cannot back up {path}: {exc}") from exc
+
+    try:
+        os.replace(temp_path, path)
+    except OSError as exc:
+        _best_effort_unlink(temp_path)
+        _best_effort_unlink(backup_path)
+        raise ORZIPError(f"cannot replace {path}: {exc}") from exc
 
 
 def detect_bytes(data: bytes) -> Detection:
@@ -111,10 +191,18 @@ def zlib_decompress_container(data: bytes) -> bytes:
     det = detect_bytes(data)
     if det.kind != "compressed" or det.payload_offset is None:
         raise ORZIPError(det.detail)
+    decompressor = zlib.decompressobj()
     try:
-        payload = zlib.decompress(data[det.payload_offset:])
+        payload = decompressor.decompress(data[det.payload_offset:])
+        payload += decompressor.flush()
     except zlib.error as exc:
         raise ORZIPError(f"zlib decompression failed: {exc}") from exc
+    if not decompressor.eof:
+        raise ORZIPError("zlib stream is incomplete or truncated")
+    if decompressor.unconsumed_tail:
+        raise ORZIPError(f"zlib stream has {len(decompressor.unconsumed_tail)} bytes of unconsumed data")
+    if decompressor.unused_data:
+        raise ORZIPError(f"trailing data after zlib stream: {len(decompressor.unused_data)} bytes")
     if det.declared_length is not None and len(payload) != det.declared_length:
         raise ORZIPError(f"length mismatch: header declares {det.declared_length} bytes, decompressed {len(payload)} bytes")
     return payload
@@ -141,6 +229,18 @@ def extract_binary_payload(data: bytes) -> bytes:
     if payload[7:8] != b"b":
         raise ORZIPError(f"JINX0 payload is not binary/tokenized: {payload[:14]!r}")
     return payload
+
+
+def reject_text_input_for_uncompress(path: Path, det: Detection) -> None:
+    if det.kind in {"unicode-text", "unicode", "ascii-text-or-binary"}:
+        raise ORZIPError(f"cannot uncompress {path}: file is already uncompressed text; use compress for text -> compressed binary")
+
+
+def reject_binary_input_for_compress(path: Path, det: Detection) -> None:
+    if det.kind == "compressed":
+        raise ORZIPError(f"cannot compress {path}: file is already compressed; use uncompress for compressed binary -> text")
+    if det.kind == "raw-binary":
+        raise ORZIPError(f"cannot compress {path}: file is already binary s1b data; use pack to wrap raw binary payloads")
 
 
 def parse_binary_block(payload: bytes, offset: int, token_lookup) -> BinaryBlock | None:
@@ -482,8 +582,10 @@ def tokenize_s1t(text: str) -> list[str]:
             i += 1
             continue
         if ch == '"':
+            quote_start = i
             i += 1
             value = []
+            closed = False
             while i < len(text):
                 if text[i] == "\\" and i + 1 < len(text):
                     value.append(text[i + 1])
@@ -491,9 +593,12 @@ def tokenize_s1t(text: str) -> list[str]:
                     continue
                 if text[i] == '"':
                     i += 1
+                    closed = True
                     break
                 value.append(text[i])
                 i += 1
+            if not closed:
+                raise ORZIPError(f"unterminated quoted string at character {quote_start}")
             tokens.append("".join(value))
             continue
         start = i
@@ -520,7 +625,9 @@ def parse_s1t_text(text: str) -> SExprNode:
             return False
         return not any(c in token.lower() for c in ".\\/")
 
-    def parse_node(index: int) -> tuple[SExprNode, int]:
+    def parse_node(index: int, depth: int = 0) -> tuple[SExprNode, int]:
+        if depth >= MAX_S1T_NESTING:
+            raise ORZIPError(f"S1T nesting exceeds {MAX_S1T_NESTING} blocks")
         if index >= len(tokens):
             raise ORZIPError("unexpected end of tokens")
         name = tokens[index]
@@ -535,10 +642,10 @@ def parse_s1t_text(text: str) -> SExprNode:
         items: list[object] = []
         while index < len(tokens) and tokens[index] != ")":
             if can_start_node(tokens[index]) and index + 1 < len(tokens) and tokens[index + 1] == "(":
-                child, index = parse_node(index)
+                child, index = parse_node(index, depth + 1)
                 items.append(child)
             elif can_start_node(tokens[index]) and index + 2 < len(tokens) and tokens[index + 2] == "(":
-                child, index = parse_node(index)
+                child, index = parse_node(index, depth + 1)
                 items.append(child)
             else:
                 items.append(tokens[index])
@@ -557,35 +664,43 @@ def parse_scalar_token(token: object, field_type: str, defs_module) -> object:
     if isinstance(token, SExprNode):
         raise ORZIPError(f"expected scalar {field_type}, got block {token.name}")
     text = str(token)
-    if field_type == "dword":
-        return int(text[2:], 16) if text.lower().startswith("0x") else int(text, 16)
-    if field_type == "uint":
-        if text.lower().startswith("0x") or any(c in text.lower() for c in "abcdef"):
-            return int(text, 16)
-        return int(text, 10)
-    if field_type == "sint":
-        return int(text, 0)
-    if field_type == "float":
-        return float(text)
-    if field_type == "string":
-        return text
-    if field_type == "token":
-        token_id = defs_module.core_token_id(text)
-        return token_id if token_id is not None else int(text, 0)
-    raise ORZIPError(f"unknown scalar type {field_type}")
+    try:
+        if field_type == "dword":
+            return int(text[2:], 16) if text.lower().startswith("0x") else int(text, 16)
+        if field_type == "uint":
+            if text.lower().startswith("0x") or any(c in text.lower() for c in "abcdef"):
+                return int(text, 16)
+            return int(text, 10)
+        if field_type == "sint":
+            return int(text, 0)
+        if field_type == "float":
+            return float(text)
+        if field_type == "string":
+            return text
+        if field_type == "token":
+            token_id = defs_module.core_token_id(text)
+            return token_id if token_id is not None else int(text, 0)
+        raise ORZIPError(f"unknown scalar type {field_type}")
+    except (ValueError, OverflowError) as exc:
+        raise ORZIPError(f"invalid {field_type} value {text!r}") from exc
 
 
 def write_primitive(value: object, field_type: str) -> bytes:
-    if field_type in {"uint", "dword", "token"}:
-        return int(value).to_bytes(4, "little", signed=False)
-    if field_type == "sint":
-        return int(value).to_bytes(4, "little", signed=True)
-    if field_type == "float":
-        return struct.pack("<f", float(value))
-    if field_type == "string":
-        encoded = str(value).encode("utf-16le")
-        return (len(str(value))).to_bytes(2, "little") + encoded
-    raise ORZIPError(f"unknown primitive type {field_type}")
+    try:
+        if field_type in {"uint", "dword", "token"}:
+            return int(value).to_bytes(4, "little", signed=False)
+        if field_type == "sint":
+            return int(value).to_bytes(4, "little", signed=True)
+        if field_type == "float":
+            return struct.pack("<f", float(value))
+        if field_type == "string":
+            encoded = str(value).encode("utf-16le")
+            return (len(str(value))).to_bytes(2, "little") + encoded
+        raise ORZIPError(f"unknown primitive type {field_type}")
+    except UnicodeError as exc:
+        raise ORZIPError(f"cannot encode {field_type} value {value!r}") from exc
+    except (OverflowError, ValueError, struct.error) as exc:
+        raise ORZIPError(f"{field_type} value out of range: {value!r}") from exc
 
 
 def encode_s1t_node(root: SExprNode, defs_module) -> bytes:
@@ -722,6 +837,20 @@ def iter_arg_inputs(args: argparse.Namespace) -> list[Path]:
     return iter_inputs(args.inputs, args.recursive, getattr(args, "only_s", False))
 
 
+def iter_conversion_inputs(args: argparse.Namespace) -> list[Path]:
+    inputs = iter_arg_inputs(args)
+    if args.output is None:
+        return inputs
+
+    output_root = args.output.resolve()
+    directory_roots = [input_path.resolve() for input_path in args.inputs if input_path.is_dir()]
+    if output_root in directory_roots:
+        raise ORZIPError(f"output directory must not be the same as an input directory: {args.output}")
+    if any(output_root.is_relative_to(root) for root in directory_roots):
+        inputs = [input_path for input_path in inputs if not input_path.resolve().is_relative_to(output_root)]
+    return inputs
+
+
 def relative_to_input_roots(path: Path, inputs: list[Path]) -> Path:
     resolved = path.resolve()
     directory_roots = sorted((p.resolve() for p in inputs if p.is_dir()), key=lambda p: len(str(p)), reverse=True)
@@ -739,7 +868,43 @@ def convert_output_path(path: Path, args: argparse.Namespace, suffix: str) -> Pa
     if args.output:
         rel = relative_to_input_roots(path, args.inputs)
         return args.output / rel.with_suffix(rel.suffix + suffix)
-    return path.with_suffix(path.suffix + suffix)
+    return path
+
+
+def reject_planned_output_collisions(inputs: list[Path], outputs: list[Path]) -> None:
+    input_paths = {os.path.normcase(str(input_path.resolve())) for input_path in inputs}
+    seen: set[str] = set()
+    existing_outputs: list[Path] = []
+    for input_path, output in zip(inputs, outputs):
+        normalized = os.path.normcase(str(output.resolve()))
+        same_single_input = len(inputs) == 1 and normalized == os.path.normcase(str(input_path.resolve()))
+        if normalized in input_paths and not same_single_input:
+            raise ORZIPError(f"output would overwrite an input file: {output}")
+        if output.exists() and not same_single_input:
+            for other_input in inputs:
+                try:
+                    if output.samefile(other_input):
+                        raise ORZIPError(f"output is the same file as an input: {output}")
+                except OSError:
+                    continue
+        if normalized in seen:
+            raise ORZIPError(f"multiple inputs would write the same output file: {output}")
+        if output.exists():
+            for prior_output in existing_outputs:
+                try:
+                    if output.samefile(prior_output):
+                        raise ORZIPError(f"multiple outputs refer to the same file: {output}")
+                except OSError:
+                    continue
+            existing_outputs.append(output)
+        seen.add(normalized)
+
+
+def reject_output_collisions(args: argparse.Namespace, inputs: list[Path], suffix: str) -> None:
+    if args.output is None:
+        return
+    outputs = [convert_output_path(input_path, args, suffix) for input_path in inputs]
+    reject_planned_output_collisions(inputs, outputs)
 
 
 def cmd_detect(args: argparse.Namespace) -> int:
@@ -798,12 +963,24 @@ def cmd_s1b2s1t(args: argparse.Namespace) -> int:
     except ImportError as exc:
         raise ORZIPError(f"cannot import embedded definitions module orzip_defs.py: {exc}") from exc
 
-    for p in iter_arg_inputs(args):
-        payload = extract_binary_payload(_read(p))
+    inputs = iter_conversion_inputs(args)
+    reject_output_collisions(args, inputs, ".s1t.s")
+    for p in inputs:
+        data = _read(p)
+        reject_text_input_for_uncompress(p, detect_bytes(data))
+        payload = extract_binary_payload(data)
         text = render_s1t_from_payload(payload, orzip_defs)
         output_bytes = UTF16LE_BOM + text.encode("utf-16le")
-        out = args.output if len(args.inputs) == 1 and not p.is_dir() and args.output else p.with_suffix(p.suffix + ".s1t.s")
-        _write(out, output_bytes, args.force)
+        if args.output:
+            out = convert_output_path(p, args, ".s1t.s")
+        elif getattr(args, "in_place", False):
+            out = p
+        else:
+            out = p.with_suffix(p.suffix + ".s1t.s")
+        if out.resolve() == p.resolve():
+            atomic_write_in_place(out, output_bytes, create_backup=not getattr(args, "no_backup", False))
+        else:
+            _write(out, output_bytes, args.force)
         print(f"[s1b2s1t] {p} -> {out} ({len(output_bytes)} bytes)")
     return 0
 
@@ -814,17 +991,27 @@ def cmd_s1t2s1b(args: argparse.Namespace) -> int:
     except ImportError as exc:
         raise ORZIPError(f"cannot import embedded definitions module orzip_defs.py: {exc}") from exc
 
-    for p in iter_arg_inputs(args):
-        root = parse_s1t_text(decode_text_auto(_read(p)))
+    suffix = ".compressed.s" if args.compress else ".s1b"
+    inputs = iter_conversion_inputs(args)
+    reject_output_collisions(args, inputs, suffix)
+    for p in inputs:
+        data = _read(p)
+        reject_binary_input_for_compress(p, detect_bytes(data))
+        root = parse_s1t_text(decode_text_auto(data))
         payload = encode_s1t_node(root, orzip_defs)
         data = zlib_compress_container(payload, args.level) if args.compress else payload
-        if len(args.inputs) == 1 and not p.is_dir() and args.output:
-            out = args.output
+        if args.output:
+            out = convert_output_path(p, args, suffix)
+        elif getattr(args, "in_place", False):
+            out = p
         elif args.compress:
             out = p.with_suffix(p.suffix + ".compressed.s")
         else:
             out = p.with_suffix(p.suffix + ".s1b")
-        _write(out, data, args.force)
+        if out.resolve() == p.resolve():
+            atomic_write_in_place(out, data, create_backup=not getattr(args, "no_backup", False))
+        else:
+            _write(out, data, args.force)
         mode = "compressed" if args.compress else "raw"
         print(f"[s1t2s1b] {p} -> {out} ({mode}, {len(data)} bytes)")
     return 0
@@ -836,26 +1023,41 @@ def cmd_convert(args: argparse.Namespace) -> int:
     except ImportError as exc:
         raise ORZIPError(f"cannot import embedded definitions module orzip_defs.py: {exc}") from exc
 
-    inputs = iter_arg_inputs(args)
+    inputs = iter_conversion_inputs(args)
+    plans: list[tuple[Path, bytes, Detection, Path]] = []
     for p in inputs:
         data = _read(p)
         det = detect_bytes(data)
         if det.kind in {"compressed", "raw-binary"}:
+            suffix = ".s1t.s"
+        elif det.kind in {"unicode-text", "ascii-text-or-binary"}:
+            suffix = ".compressed.s"
+        else:
+            raise ORZIPError(f"convert cannot auto-convert {p}: {det.detail}")
+        plans.append((p, data, det, convert_output_path(p, args, suffix)))
+
+    if args.output:
+        reject_planned_output_collisions(inputs, [out for _, _, _, out in plans])
+
+    for p, data, det, out in plans:
+        if det.kind in {"compressed", "raw-binary"}:
             payload = extract_binary_payload(data)
             text = render_s1t_from_payload(payload, orzip_defs)
             output_data = UTF16LE_BOM + text.encode("utf-16le")
-            out = convert_output_path(p, args, ".s1t.s")
-            _write(out, output_data, args.force)
+            if out.resolve() == p.resolve():
+                atomic_write_in_place(out, output_data, create_backup=not getattr(args, "no_backup", False))
+            else:
+                _write(out, output_data, args.force)
             print(f"[convert] {p} -> {out} (binary -> text, {len(output_data)} bytes)")
-        elif det.kind in {"unicode-text", "ascii-or-unwrapped"}:
+        elif det.kind in {"unicode-text", "ascii-text-or-binary"}:
             root = parse_s1t_text(decode_text_auto(data))
             payload = encode_s1t_node(root, orzip_defs)
             output_data = zlib_compress_container(payload, args.level)
-            out = convert_output_path(p, args, ".compressed.s")
-            _write(out, output_data, args.force)
+            if out.resolve() == p.resolve():
+                atomic_write_in_place(out, output_data, create_backup=not getattr(args, "no_backup", False))
+            else:
+                _write(out, output_data, args.force)
             print(f"[convert] {p} -> {out} (text -> compressed binary, {len(output_data)} bytes)")
-        else:
-            raise ORZIPError(f"convert cannot auto-convert {p}: {det.detail}")
     return 0
 
 
@@ -875,6 +1077,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 root = parse_binary_block(payload, 16, orzip_defs.core_token_name)
                 if root is None:
                     raise ORZIPError("could not parse root binary block")
+                if root.token_name.lower() != "shape":
+                    raise ORZIPError(f"root block must be shape, got {root.token_name}")
                 render_s1t_from_payload(payload, orzip_defs)
                 print(f"{p.name}: OK")
                 print(f"  kind: {det.kind}")
@@ -884,9 +1088,11 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 print(f"  payload header: {payload[:16].decode('ascii', errors='replace').rstrip()}")
                 print(f"  root block: {root.token_name}")
                 print("  grammar decode: OK")
-            elif det.kind in {"unicode-text", "ascii-or-unwrapped"}:
+            elif det.kind in {"unicode-text", "ascii-text-or-binary"}:
                 text = decode_text_auto(data)
                 root = parse_s1t_text(text)
+                if root.name.lower() != "shape":
+                    raise ORZIPError(f"root block must be shape, got {root.name}")
                 payload = encode_s1t_node(root, orzip_defs)
                 print(f"{p.name}: OK")
                 print(f"  kind: {det.kind}")
@@ -935,7 +1141,7 @@ def cmd_roundtrip(args: argparse.Namespace) -> int:
                     print("  payload match: differs")
                     print(f"  original sha256: {digest}")
                     print(f"  roundtrip sha256: {hashlib.sha256(roundtrip_payload).hexdigest()}")
-            elif det.kind in {"unicode-text", "ascii-or-unwrapped"}:
+            elif det.kind in {"unicode-text", "ascii-text-or-binary"}:
                 text = decode_text_auto(data)
                 root = parse_s1t_text(text)
                 payload = encode_s1t_node(root, orzip_defs)
@@ -1166,83 +1372,152 @@ def cmd_dump_values(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
+PRIMARY_COMMANDS = "info,check,test,convert,text,binary,raw,wrap,repack,defs,blocks,values"
+ADVANCED_COMMANDS = (
+    "info,detect,check,validate,test,roundtrip,convert,text,uncompress,s1b2s1t,"
+    "binary,compress,s1t2s1b,raw,unpack,wrap,pack,repack,normalize,defs,blocks,"
+    "dump-blocks,values,dump-values"
+)
+
+
+def build_parser(advanced_help: bool = False) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="orzip.py",
         description="Standalone MSTS/Open Rails SIMISA zlib compressor/decompressor for compressed binary .s containers.",
     )
-    parser.add_argument("--version", action="version", version="ORZIP 1.0.2")
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument("--version", action="version", version="ORZIP 1.0.3")
+    parser.add_argument("--advanced-help", action="store_true", help="show all compatibility and technical commands")
+    sub = parser.add_subparsers(dest="command", metavar=ADVANCED_COMMANDS if advanced_help else PRIMARY_COMMANDS)
 
     def add_common(sp: argparse.ArgumentParser) -> None:
         sp.add_argument("inputs", nargs="+", type=Path)
         sp.add_argument("-r", "--recursive", action="store_true", help="recurse into directory inputs")
-        sp.add_argument("--only-s", action="store_true", help="when processing directories, include only .s/.S files")
+        sp.add_argument("-s", "--only-s", action="store_true", help="when processing directories, include only .s/.S files")
 
-    p = sub.add_parser("detect", help="identify file type")
+    def add_no_backup(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument(
+            "--no-backup",
+            action="store_true",
+            help="skip backup for in-place conversion; atomic replacement is still used",
+        )
+
+    p = sub.add_parser("info", help="identify file type")
     add_common(p)
-    p.add_argument("--verify", action="store_true", help="also inflate compressed files and check declared size")
+    p.add_argument("-v", "--verify", action="store_true", help="also inflate compressed files and check declared size")
     p.set_defaults(func=cmd_detect)
 
-    p = sub.add_parser("unpack", help="SIMISA@F compressed file -> raw JINX0... binary payload")
+    p = sub.add_parser("detect", help="identify file type" if advanced_help else argparse.SUPPRESS)
+    add_common(p)
+    p.add_argument("-v", "--verify", action="store_true", help="also inflate compressed files and check declared size")
+    p.set_defaults(func=cmd_detect)
+
+    p = sub.add_parser("raw", help="extract raw JINX0... binary payload")
     add_common(p)
     p.add_argument("-o", "--output", type=Path, help="output path for a single input")
-    p.add_argument("--force", action="store_true", help="overwrite output files")
+    p.add_argument("-f", "--force", action="store_true", help="overwrite output files")
     p.set_defaults(func=cmd_unpack)
 
-    p = sub.add_parser("pack", help="raw JINX0... binary payload -> SIMISA@F compressed file")
+    p = sub.add_parser("unpack", help="SIMISA@F compressed file -> raw JINX0... binary payload" if advanced_help else argparse.SUPPRESS)
     add_common(p)
     p.add_argument("-o", "--output", type=Path, help="output path for a single input")
-    p.add_argument("--force", action="store_true", help="overwrite output files")
-    p.add_argument("--level", type=int, default=9, choices=range(0, 10), metavar="0-9", help="zlib compression level (default: 9)")
+    p.add_argument("-f", "--force", action="store_true", help="overwrite output files")
+    p.set_defaults(func=cmd_unpack)
+
+    p = sub.add_parser("wrap", help="wrap raw JINX0... binary payload as compressed SIMISA@F")
+    add_common(p)
+    p.add_argument("-o", "--output", type=Path, help="output path for a single input")
+    p.add_argument("-f", "--force", action="store_true", help="overwrite output files")
+    p.add_argument("-l", "--level", type=int, default=9, choices=range(0, 10), metavar="0-9", help="zlib compression level (default: 9)")
     p.set_defaults(func=cmd_pack)
 
-    p = sub.add_parser("normalize", help="inflate and repack a compressed SIMISA@F file with modern zlib")
+    p = sub.add_parser("pack", help="raw JINX0... binary payload -> SIMISA@F compressed file" if advanced_help else argparse.SUPPRESS)
     add_common(p)
     p.add_argument("-o", "--output", type=Path, help="output path for a single input")
-    p.add_argument("--force", action="store_true", help="overwrite output files")
-    p.add_argument("--level", type=int, default=9, choices=range(0, 10), metavar="0-9", help="zlib compression level (default: 9)")
+    p.add_argument("-f", "--force", action="store_true", help="overwrite output files")
+    p.add_argument("-l", "--level", type=int, default=9, choices=range(0, 10), metavar="0-9", help="zlib compression level (default: 9)")
+    p.set_defaults(func=cmd_pack)
+
+    p = sub.add_parser("repack", help="inflate and recompress a compressed SIMISA@F file")
+    add_common(p)
+    p.add_argument("-o", "--output", type=Path, help="output path for a single input")
+    p.add_argument("-f", "--force", action="store_true", help="overwrite output files")
+    p.add_argument("-l", "--level", type=int, default=9, choices=range(0, 10), metavar="0-9", help="zlib compression level (default: 9)")
     p.set_defaults(func=cmd_normalize)
 
-    p = sub.add_parser("s1b2s1t", help="convert compressed/raw binary s1b shape data to UTF-16 text s1t")
+    p = sub.add_parser("normalize", help="inflate and repack a compressed SIMISA@F file with modern zlib" if advanced_help else argparse.SUPPRESS)
     add_common(p)
     p.add_argument("-o", "--output", type=Path, help="output path for a single input")
-    p.add_argument("--force", action="store_true", help="overwrite output files")
-    p.set_defaults(func=cmd_s1b2s1t)
+    p.add_argument("-f", "--force", action="store_true", help="overwrite output files")
+    p.add_argument("-l", "--level", type=int, default=9, choices=range(0, 10), metavar="0-9", help="zlib compression level (default: 9)")
+    p.set_defaults(func=cmd_normalize)
 
-    p = sub.add_parser("decompress-text", help="alias for s1b2s1t")
+    p = sub.add_parser("text", help="make a binary/compressed shape file editable text")
     add_common(p)
     p.add_argument("-o", "--output", type=Path, help="output path for a single input")
-    p.add_argument("--force", action="store_true", help="overwrite output files")
-    p.set_defaults(func=cmd_s1b2s1t)
+    p.add_argument("-f", "--force", action="store_true", help="overwrite output files")
+    add_no_backup(p)
+    p.set_defaults(func=cmd_s1b2s1t, in_place=True)
 
-    p = sub.add_parser("s1t2s1b", help="convert UTF-16/UTF-8 text s1t shape data to binary s1b")
+    p = sub.add_parser("uncompress", help="convert compressed/raw binary s1b shape data to UTF-16 text s1t" if advanced_help else argparse.SUPPRESS)
     add_common(p)
     p.add_argument("-o", "--output", type=Path, help="output path for a single input")
-    p.add_argument("--force", action="store_true", help="overwrite output files")
+    p.add_argument("-f", "--force", action="store_true", help="overwrite output files")
+    add_no_backup(p)
+    p.set_defaults(func=cmd_s1b2s1t, in_place=True)
+
+    p = sub.add_parser("s1b2s1t", help="convert compressed/raw binary s1b shape data to UTF-16 text s1t" if advanced_help else argparse.SUPPRESS)
+    add_common(p)
+    p.add_argument("-o", "--output", type=Path, help="output path for a single input")
+    p.add_argument("-f", "--force", action="store_true", help="overwrite output files")
+    add_no_backup(p)
+    p.set_defaults(func=cmd_s1b2s1t, in_place=False)
+
+    p = sub.add_parser("binary", help="make an editable text shape file compressed binary")
+    add_common(p)
+    p.add_argument("-o", "--output", type=Path, help="output path for a single input")
+    p.add_argument("-f", "--force", action="store_true", help="overwrite output files")
+    p.add_argument("-l", "--level", type=int, default=9, choices=range(0, 10), metavar="0-9", help="zlib compression level (default: 9)")
+    add_no_backup(p)
+    p.set_defaults(func=cmd_s1t2s1b, compress=True, in_place=True)
+
+    p = sub.add_parser("compress", help="convert text s1t shape data to compressed SIMISA@F .s" if advanced_help else argparse.SUPPRESS)
+    add_common(p)
+    p.add_argument("-o", "--output", type=Path, help="output path for a single input")
+    p.add_argument("-f", "--force", action="store_true", help="overwrite output files")
+    p.add_argument("-l", "--level", type=int, default=9, choices=range(0, 10), metavar="0-9", help="zlib compression level (default: 9)")
+    add_no_backup(p)
+    p.set_defaults(func=cmd_s1t2s1b, compress=True, in_place=True)
+
+    p = sub.add_parser("s1t2s1b", help="convert UTF-16/UTF-8 text s1t shape data to binary s1b" if advanced_help else argparse.SUPPRESS)
+    add_common(p)
+    p.add_argument("-o", "--output", type=Path, help="output path for a single input")
+    p.add_argument("-f", "--force", action="store_true", help="overwrite output files")
     p.add_argument("--compress", action="store_true", help="wrap output as compressed SIMISA@F .s instead of raw s1b")
-    p.add_argument("--level", type=int, default=9, choices=range(0, 10), metavar="0-9", help="zlib compression level when --compress is used (default: 9)")
-    p.set_defaults(func=cmd_s1t2s1b)
-
-    p = sub.add_parser("compress-text", help="text s1t -> compressed SIMISA@F .s")
-    add_common(p)
-    p.add_argument("-o", "--output", type=Path, help="output path for a single input")
-    p.add_argument("--force", action="store_true", help="overwrite output files")
-    p.add_argument("--level", type=int, default=9, choices=range(0, 10), metavar="0-9", help="zlib compression level (default: 9)")
-    p.set_defaults(func=cmd_s1t2s1b, compress=True)
+    p.add_argument("-l", "--level", type=int, default=9, choices=range(0, 10), metavar="0-9", help="zlib compression level when --compress is used (default: 9)")
+    add_no_backup(p)
+    p.set_defaults(func=cmd_s1t2s1b, in_place=False)
 
     p = sub.add_parser("convert", help="auto-convert binary .s/raw s1b to text, or text s1t to compressed binary")
     add_common(p)
     p.add_argument("-o", "--output", type=Path, help="output path for a single input")
-    p.add_argument("--force", action="store_true", help="overwrite output files")
-    p.add_argument("--level", type=int, default=9, choices=range(0, 10), metavar="0-9", help="zlib compression level for text -> compressed output (default: 9)")
+    p.add_argument("-f", "--force", action="store_true", help="overwrite output files")
+    p.add_argument("-l", "--level", type=int, default=9, choices=range(0, 10), metavar="0-9", help="zlib compression level for text -> compressed output (default: 9)")
+    add_no_backup(p)
     p.set_defaults(func=cmd_convert)
 
-    p = sub.add_parser("validate", help="validate compressed/raw/text shape files without writing output")
+    p = sub.add_parser("check", help="validate shape files without writing output")
     add_common(p)
     p.set_defaults(func=cmd_validate)
 
-    p = sub.add_parser("roundtrip", help="test binary/text conversion round-trips without writing output")
+    p = sub.add_parser("validate", help="validate compressed/raw/text shape files without writing output" if advanced_help else argparse.SUPPRESS)
+    add_common(p)
+    p.set_defaults(func=cmd_validate)
+
+    p = sub.add_parser("test", help="test binary/text conversion round-trips without writing output")
+    add_common(p)
+    p.set_defaults(func=cmd_roundtrip)
+
+    p = sub.add_parser("roundtrip", help="test binary/text conversion round-trips without writing output" if advanced_help else argparse.SUPPRESS)
     add_common(p)
     p.set_defaults(func=cmd_roundtrip)
 
@@ -1251,20 +1526,44 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--grammar", help="shape grammar rule name to display")
     p.set_defaults(func=cmd_defs)
 
-    p = sub.add_parser("dump-blocks", help="dump binary s1b block headers from compressed or raw files")
+    p = sub.add_parser("blocks", help="dump binary block headers from compressed or raw files")
     add_common(p)
-    p.add_argument("--max-depth", type=int, default=3, help="maximum child-block depth to scan (default: 3)")
-    p.add_argument("--limit", type=int, default=200, help="maximum blocks to print per file (default: 200)")
+    p.add_argument("-d", "--max-depth", type=int, default=3, help="maximum child-block depth to scan (default: 3)")
+    p.add_argument("-n", "--limit", type=int, default=200, help="maximum blocks to print per file (default: 200)")
     p.add_argument("--show-gaps", action="store_true", help="also show non-block data gaps between child blocks")
     p.set_defaults(func=cmd_dump_blocks)
 
-    p = sub.add_parser("dump-values", help="grammar-decode binary s1b blocks into named fields")
+    p = sub.add_parser("dump-blocks", help="dump binary s1b block headers from compressed or raw files" if advanced_help else argparse.SUPPRESS)
     add_common(p)
-    p.add_argument("--max-depth", type=int, default=3, help="maximum block depth to decode (default: 3)")
-    p.add_argument("--item-limit", type=int, default=8, help="maximum repeated items to print per list; -1 means no limit (default: 8)")
-    p.add_argument("--block-limit", type=int, default=500, help="maximum decoded blocks to print per file (default: 500)")
+    p.add_argument("-d", "--max-depth", type=int, default=3, help="maximum child-block depth to scan (default: 3)")
+    p.add_argument("-n", "--limit", type=int, default=200, help="maximum blocks to print per file (default: 200)")
+    p.add_argument("--show-gaps", action="store_true", help="also show non-block data gaps between child blocks")
+    p.set_defaults(func=cmd_dump_blocks)
+
+    p = sub.add_parser("values", help="decode binary blocks into named values")
+    add_common(p)
+    p.add_argument("-d", "--max-depth", type=int, default=3, help="maximum block depth to decode (default: 3)")
+    p.add_argument("-i", "--item-limit", type=int, default=8, help="maximum repeated items to print per list; -1 means no limit (default: 8)")
+    p.add_argument("-b", "--block-limit", type=int, default=500, help="maximum decoded blocks to print per file (default: 500)")
     p.add_argument("--strict", action="store_true", help="stop on the first grammar decode error")
     p.set_defaults(func=cmd_dump_values)
+
+    p = sub.add_parser("dump-values", help="grammar-decode binary s1b blocks into named fields" if advanced_help else argparse.SUPPRESS)
+    add_common(p)
+    p.add_argument("-d", "--max-depth", type=int, default=3, help="maximum block depth to decode (default: 3)")
+    p.add_argument("-i", "--item-limit", type=int, default=8, help="maximum repeated items to print per list; -1 means no limit (default: 8)")
+    p.add_argument("-b", "--block-limit", type=int, default=500, help="maximum decoded blocks to print per file (default: 500)")
+    p.add_argument("--strict", action="store_true", help="stop on the first grammar decode error")
+    p.set_defaults(func=cmd_dump_values)
+
+    if not advanced_help:
+        primary_order = PRIMARY_COMMANDS.split(",")
+        sub._choices_actions = [
+            action
+            for command in primary_order
+            for action in sub._choices_actions
+            if action.dest == command and action.help != argparse.SUPPRESS
+        ]
 
     return parser
 
@@ -1272,6 +1571,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.advanced_help:
+        build_parser(advanced_help=True).print_help()
+        return 0
+    if args.command is None:
+        parser.print_help()
+        return 0
     try:
         return args.func(args)
     except ORZIPError as exc:

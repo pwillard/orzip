@@ -1,19 +1,20 @@
-# ORZIP
+# ORZIP 1.0.3
 
-ORZIP is a standalone modern Python tool for the MSTS/Open Rails `SIMISA@F` compressed-binary container used by `.s` shape files.
+ORZIP is a standalone Python tool for MSTS/Open Rails `.s` shape files. It reads and writes the `SIMISA@F` compressed container and converts between binary/tokenized `s1b` data and editable textual `s1t` data without requiring FFEDIT or external `.tok`, `.bnf`, or `.hdr` files.
 
-It replaces the old FFEDITC compression wrapper without using `ffeditc_unicode.exe`, `ffedit.exe`, `.tok`, `.bnf`, or `.hdr` files.
+Use `check` and `test` before converting a route or trainset:
 
-References to S1b and S1t refer to the compressed state from a SIMISA perspective, with B representing BINARY (compressed) and T representing  TEXT (uncompressed) 
+    orzip.exe check -r -s "C:\MSTS\ROUTES\MyRoute\SHAPES"
+    orzip.exe test -r -s "C:\MSTS\ROUTES\MyRoute\SHAPES"
 
-You can convert individual files or folders
+Convert in place:
 
-Typical folder workflow: Use the --only-s option with a folder reference to process the S files in a folder.
+    orzip.exe convert -r -s "C:\MSTS\ROUTES\MyRoute\SHAPES"
 
-    orzip.exe validate -r --only-s "C:\MSTS\ROUTES\MyRoute\SHAPES"
-    orzip.exe roundtrip -r --only-s "C:\MSTS\ROUTES\MyRoute\SHAPES"
-    orzip.exe convert -r --only-s "C:\MSTS\ROUTES\MyRoute\SHAPES"
+In-place conversion creates versioned backups beside each source file (`model.s.bak`, `model.s.bak.1`, and so on) and replaces the source atomically. To leave the source tree untouched, use a separate output directory:
 
-Important: because convert is now in-place by default, make a backup first if you are converting the original MSTS/Open Rails folders directly.
+    orzip.exe convert -r -s "C:\MSTS\ROUTES\MyRoute\SHAPES" -o "C:\MSTS\ROUTES\MyRoute\SHAPES_ORZIP"
 
-NOTE: This is a barely tested piece of code cobbled together in an afternoon.  It may fail spectacularly.  You have been warned.
+Advanced users can add `--no-backup` to an in-place `convert`, `text`, or `binary` command. Replacement remains atomic, but the previous file contents are not retained.
+
+Run `orzip.exe --help` for the concise command list or `orzip.exe --advanced-help` for compatibility and technical aliases. See `USER_GUIDE.md` for normal workflows and `README-ORZIP.md` for format and developer details.

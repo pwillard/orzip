@@ -1,0 +1,26 @@
+# Build/distribution output
+/DIST/
+/dist/
+
+# Local sample shape files used for manual checks; large and not source
+/samples/
+/SAMPLES/
+
+# Legacy/staging folders that should not be committed
+/Orzip/
+/ORZIP/
+/OLD/
+
+# Python local caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local virtual environments
+.venv/
+venv/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
