@@ -21,4 +21,4 @@ Run `orzip.exe --help` for the concise command list or `orzip.exe --advanced-hel
 
 # NOTE
 
-This update removes some extra functions that likely would never be used and adds extra functionality, such as making backup copies. These are breaking changes and will cause older versions of SFM3 to fail.
+This update removes some extra functions that likely would never be used and adds extra functionality, such as making backup copies. These are breaking changes and may cause older versions of SFM3 to fail.
