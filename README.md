@@ -1,6 +1,8 @@
 # ORZIP 1.0.3
 
-NOTE: What you probably want is on the *releases* page  ---- look over there ---->
+## NOTE: What you probably want is on the *releases* page  ---- look over there ---->
+
+## What is ORZIP?
 
 ORZIP is a standalone Python tool for MSTS/Open Rails `.s` shape files. It reads and writes the `SIMISA@F` compressed container and converts between binary/tokenized `s1b` data and editable textual `s1t` data without requiring FFEDIT or external `.tok`, `.bnf`, or `.hdr` files.
 
