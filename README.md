@@ -1,6 +1,7 @@
 # ORZIP 1.0.3
 
-## NOTE: What you probably want is on the *releases* page  ---- look over there ---->
+## NOTE: What you probably want is on the *releases* page 
+---- look over there ---->
 
 ## What is ORZIP?
 
