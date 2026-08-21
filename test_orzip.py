@@ -21,6 +21,8 @@ DASH8_COMPRESSED = LOCAL_SAMPLES_DIR / "dash8.s"
 DASH8_TEXT = LOCAL_SAMPLES_DIR / "dash8u.s"
 SHAPE_275004_KN = LOCAL_SAMPLES_DIR / "275004_KN.s"
 SHAPE_275004_LN = LOCAL_SAMPLES_DIR / "275004_LN.s"
+KIHA31_WIPER_TEXT = LOCAL_SAMPLES_DIR / "kiha31wiper.s"
+KIHA31_WIPER_REFERENCE_COMPRESSED = Path("C:/tmp/kiha31wiper.s") if os.name == "nt" else Path("/mnt/c/tmp/kiha31wiper.s")
 
 SYNTHETIC_TEXT_CONTENT = """SIMISA@@@@@@@@@@JINX0s1t______
 shape (
@@ -278,11 +280,17 @@ class ORZIPRegressionTests(unittest.TestCase):
         self.assertEqual(payload, SYNTHETIC_PAYLOAD)
         self.assertTrue(payload.startswith(b"JINX0s1b______" + bytes([13, 10])))
 
-    def test_decompress_rejects_bytes_after_zlib_stream(self) -> None:
+    def test_decompress_tolerates_bytes_after_zlib_stream_by_default(self) -> None:
+        payload = b"JINX0s1b______" + bytes([13, 10])
+        container = orzip.zlib_compress_container(payload)
+
+        self.assertEqual(orzip.zlib_decompress_container(container + b"GARBAGE"), payload)
+
+    def test_decompress_strict_mode_rejects_bytes_after_zlib_stream(self) -> None:
         container = orzip.zlib_compress_container(b"JINX0s1b______" + bytes([13, 10]))
 
         with self.assertRaisesRegex(orzip.ORZIPError, "trailing data"):
-            orzip.zlib_decompress_container(container + b"GARBAGE")
+            orzip.zlib_decompress_container(container + b"GARBAGE", strict_trailing=True)
 
     def test_decompress_rejects_truncated_zlib_stream(self) -> None:
         container = orzip.zlib_compress_container(b"JINX0s1b______" + bytes([13, 10]))
@@ -298,7 +306,7 @@ class ORZIPRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(orzip.ORZIPError, "length mismatch"):
             orzip.zlib_decompress_container(bytes(container))
 
-    def test_cli_check_rejects_bytes_after_zlib_stream(self) -> None:
+    def test_cli_check_warns_but_accepts_bytes_after_zlib_stream_by_default(self) -> None:
         with tempfile.TemporaryDirectory(prefix="orzip-stream-test-") as td:
             damaged = Path(td) / "trailing.s"
             damaged.write_bytes(SYNTHETIC_COMPRESSED.read_bytes() + b"GARBAGE")
@@ -311,8 +319,25 @@ class ORZIPRegressionTests(unittest.TestCase):
                 text=True,
             )
 
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("trailing data after zlib stream: 7 bytes", result.stdout)
+            self.assertIn("warning", result.stdout.lower())
+
+    def test_cli_check_strict_zlib_rejects_bytes_after_zlib_stream(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="orzip-stream-test-") as td:
+            damaged = Path(td) / "trailing.s"
+            damaged.write_bytes(SYNTHETIC_COMPRESSED.read_bytes() + b"GARBAGE")
+
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "orzip.py"), "check", "--strict-zlib", str(damaged)],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
             self.assertEqual(result.returncode, 1)
-            self.assertIn("trailing data", result.stdout)
+            self.assertIn("trailing data after zlib stream: 7 bytes", result.stdout)
 
     def test_synthetic_text_encodes_to_byte_exact_binary_payload(self) -> None:
         expected_payload = orzip.zlib_decompress_container(SYNTHETIC_COMPRESSED.read_bytes())
@@ -320,6 +345,23 @@ class ORZIPRegressionTests(unittest.TestCase):
         actual_payload = orzip.encode_s1t_node(root, orzip_defs)
 
         self.assertEqual(actual_payload, expected_payload)
+
+    @requires_local_samples(KIHA31_WIPER_TEXT, KIHA31_WIPER_REFERENCE_COMPRESSED)
+    def test_text_with_top_level_max_data_matches_reference_compressed_payload(self) -> None:
+        text = orzip.decode_text_auto(KIHA31_WIPER_TEXT.read_bytes())
+        roots = orzip.parse_s1t_roots(text)
+        actual_payload = orzip.encode_s1t_nodes(roots, orzip_defs)
+        expected_payload = orzip.zlib_decompress_container(KIHA31_WIPER_REFERENCE_COMPRESSED.read_bytes())
+
+        self.assertEqual([root.name for root in roots], ["shape", "max_data"])
+        self.assertEqual(actual_payload, expected_payload)
+
+    def test_single_root_parser_rejects_multiple_roots_with_clear_count(self) -> None:
+        base_text = orzip.decode_text_auto(SYNTHETIC_TEXT.read_bytes())
+        multi_root_text = base_text + (chr(13) + chr(10)) + "max_data ( )" + (chr(13) + chr(10))
+
+        with self.assertRaisesRegex(orzip.ORZIPError, "expected one root block, got 2"):
+            orzip.parse_s1t_text(multi_root_text)
 
     def test_synthetic_binary_renders_known_shape_values(self) -> None:
         payload = orzip.zlib_decompress_container(SYNTHETIC_COMPRESSED.read_bytes())

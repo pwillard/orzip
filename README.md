@@ -1,4 +1,4 @@
-# ORZIP 1.0.3
+# ORZIP 1.0.4
 
 ## NOTE: What you probably want is on the *releases* page 
 ---- look over there ---->

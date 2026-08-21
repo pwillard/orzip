@@ -1,4 +1,4 @@
-# ORZIP 1.0.3 User Guide
+# ORZIP 1.0.4 User Guide
 
 This guide is for MSTS/Open Rails users who want to check or convert `.s` shape files without needing to understand the internals of the SIMISA file format.
 
@@ -361,7 +361,7 @@ If ORZIP reports `unsupported`, the file was not recognized as a supported SIMIS
 
 If ORZIP reports `invalid`, the file looked like a supported format but failed a required check. The following `reason:` line explains what failed.
 
-Expected input and filesystem problems are reported without a Python traceback. Examples include invalid numeric fields, values outside their binary range, unterminated quoted strings, text nested beyond 256 blocks, output-directory failures, truncated compression streams, and trailing data.
+Expected input and filesystem problems are reported without a Python traceback. Examples include invalid numeric fields, values outside their binary range, unterminated quoted strings, text nested beyond 256 blocks, output-directory failures, and truncated compression streams. A complete zlib stream with trailing bytes is reported as a warning by default; use `--strict-zlib` when you want that condition to be treated as invalid.
 
 ## Notes and limitations
 

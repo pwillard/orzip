@@ -1,4 +1,4 @@
-# ORZIP 1.0.3
+# ORZIP 1.0.4
 
 ORZIP is a standalone modern Python tool for the MSTS/Open Rails `SIMISA@F` compressed-binary container used by `.s` shape files.
 
@@ -15,7 +15,7 @@ It replaces the old FFEDITC compression wrapper without using `ffeditc_unicode.e
 - Atomic in-place replacement with versioned backups.
 - Mirrored output trees for directory and multiple-file conversion.
 - Preflight protection against output/output, output/input, symlink, and hard-link collisions.
-- Strict zlib validation, including truncation, trailing-data, and declared-length checks.
+- Tolerant real-world zlib handling: trailing bytes after a complete stream are warnings by default, with `--strict-zlib` available when you want them treated as errors.
 - Inspect embedded MSTS/FFEDIT token and shape grammar definitions with `defs`.
 - Dump binary `s1b` block headers/hierarchy from compressed or raw files with `blocks`.
 - Decode binary `s1b` block contents into grammar-named values with `values`.
@@ -81,7 +81,7 @@ For `convert`, `text`, `binary`, and their technical aliases, one explicit input
 
 ## Validation and safety
 
-For compressed files, `check` verifies the SIMISA header, complete zlib stream consumption, absence of trailing data, declared payload length, binary header, root block, and grammar decode. Text input is parsed and grammar-encoded without writing output. Malformed values, unterminated strings, excessive nesting, and expected filesystem failures are reported as concise ORZIP errors rather than Python tracebacks.
+For compressed files, `check` verifies the SIMISA header, complete zlib stream, declared payload length, binary header, root block, and grammar decode. If a valid zlib stream has trailing bytes, ORZIP reports a warning and continues by default because some real-world MSTS/Open Rails shape files contain harmless exporter/padding junk after the stream. Add `--strict-zlib` to make trailing data a validation error. Text input is parsed and grammar-encoded without writing output. Malformed values, unterminated strings, excessive nesting, and expected filesystem failures are reported as concise ORZIP errors rather than Python tracebacks.
 
 ## Regression tests
 
@@ -184,7 +184,7 @@ python orzip.py check model.s model_text.s
 
 For compressed/raw binary shape files it checks:
 
-- complete zlib stream, no trailing data, and declared payload size when compressed
+- complete zlib stream and declared payload size when compressed; trailing bytes after a complete stream are shown as warnings unless `--strict-zlib` is used
 - `JINX0s1b` binary payload header
 - root binary block parses as `shape`
 - grammar-guided binary decode succeeds

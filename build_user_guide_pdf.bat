@@ -30,7 +30,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-%PYTHON% -c "from pypdf import PdfReader; p='DIST/DOCS/ORZIP_EXE_User_Guide.pdf'; r=PdfReader(p); text='\n'.join((x.extract_text() or '') for x in r.pages); assert 'ORZIP 1.0.3 User Guide' in text; assert 'model.s.bak.1' in text; print(f'Verified PDF: {len(r.pages)} pages, {len(text)} extracted characters')"
+%PYTHON% -c "from pypdf import PdfReader; p='DIST/DOCS/ORZIP_EXE_User_Guide.pdf'; r=PdfReader(p); text='\n'.join((x.extract_text() or '') for x in r.pages); assert 'ORZIP 1.0.4 User Guide' in text; assert 'model.s.bak.1' in text; print(f'Verified PDF: {len(r.pages)} pages, {len(text)} extracted characters')"
 if errorlevel 1 exit /b 1
 
 echo Built: %CD%\DIST\DOCS\ORZIP_EXE_User_Guide.pdf

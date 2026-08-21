@@ -187,7 +187,7 @@ def detect_bytes(data: bytes) -> Detection:
     return Detection("unknown", "not a recognized SIMISA/ORZIP file")
 
 
-def zlib_decompress_container(data: bytes) -> bytes:
+def zlib_decompress_container(data: bytes, *, strict_trailing: bool = False) -> bytes:
     det = detect_bytes(data)
     if det.kind != "compressed" or det.payload_offset is None:
         raise ORZIPError(det.detail)
@@ -201,11 +201,26 @@ def zlib_decompress_container(data: bytes) -> bytes:
         raise ORZIPError("zlib stream is incomplete or truncated")
     if decompressor.unconsumed_tail:
         raise ORZIPError(f"zlib stream has {len(decompressor.unconsumed_tail)} bytes of unconsumed data")
-    if decompressor.unused_data:
+    if strict_trailing and decompressor.unused_data:
         raise ORZIPError(f"trailing data after zlib stream: {len(decompressor.unused_data)} bytes")
     if det.declared_length is not None and len(payload) != det.declared_length:
         raise ORZIPError(f"length mismatch: header declares {det.declared_length} bytes, decompressed {len(payload)} bytes")
     return payload
+
+
+def zlib_trailing_data_length(data: bytes) -> int:
+    det = detect_bytes(data)
+    if det.kind != "compressed" or det.payload_offset is None:
+        return 0
+    decompressor = zlib.decompressobj()
+    try:
+        decompressor.decompress(data[det.payload_offset:])
+        decompressor.flush()
+    except zlib.error:
+        return 0
+    if not decompressor.eof:
+        return 0
+    return len(decompressor.unused_data)
 
 
 def zlib_compress_container(payload: bytes, level: int = 9) -> bytes:
@@ -214,10 +229,10 @@ def zlib_compress_container(payload: bytes, level: int = 9) -> bytes:
     return COMPRESSED_MAGIC + len(payload).to_bytes(4, "little") + b"@@@@" + zlib.compress(payload, level)
 
 
-def extract_binary_payload(data: bytes) -> bytes:
+def extract_binary_payload(data: bytes, *, strict_trailing: bool = False) -> bytes:
     det = detect_bytes(data)
     if det.kind == "compressed":
-        payload = zlib_decompress_container(data)
+        payload = zlib_decompress_container(data, strict_trailing=strict_trailing)
     elif det.kind == "raw-binary":
         payload = data
     else:
@@ -465,8 +480,15 @@ def format_s1t_value(value: object, field_type: str, defs_module) -> str:
 
 
 def render_s1t_from_payload(payload: bytes, defs_module) -> str:
-    root = parse_binary_block(payload, 16, defs_module.core_token_name)
-    if root is None:
+    roots: list[BinaryBlock] = []
+    offset = 16
+    while offset < len(payload):
+        root = parse_binary_block(payload, offset, defs_module.core_token_name)
+        if root is None:
+            raise ORZIPError(f"could not parse top-level binary block at 0x{offset:08x}")
+        roots.append(root)
+        offset = root.end
+    if not roots:
         raise ORZIPError("could not parse root binary block")
 
     def decode_entries(items: list[tuple], pos: int, end: int, counts: dict[str, int]) -> tuple[list[tuple], int]:
@@ -552,9 +574,10 @@ def render_s1t_from_payload(payload: bytes, defs_module) -> str:
         out.append("\t" * depth + ")")
 
     lines = ["SIMISA@@@@@@@@@@JINX0s1t______", ""]
-    emit_block(render_block(root), 0, lines)
-    lines.append("")
-    return "\r\n".join(lines)
+    for root in roots:
+        emit_block(render_block(root), 0, lines)
+        lines.append("")
+    return (chr(13) + chr(10)).join(lines)
 
 
 def decode_text_auto(data: bytes) -> str:
@@ -608,7 +631,7 @@ def tokenize_s1t(text: str) -> list[str]:
     return tokens
 
 
-def parse_s1t_text(text: str) -> SExprNode:
+def parse_s1t_roots(text: str) -> list[SExprNode]:
     tokens = tokenize_s1t(text.lstrip("\ufeff"))
     if not tokens:
         raise ORZIPError("empty text file")
@@ -654,10 +677,19 @@ def parse_s1t_text(text: str) -> SExprNode:
             raise ORZIPError(f"missing ')' for {name}")
         return SExprNode(name, label, items), index + 1
 
-    root, index = parse_node(0)
-    if index != len(tokens):
-        raise ORZIPError(f"extra tokens after root block: {len(tokens) - index}")
-    return root
+    roots: list[SExprNode] = []
+    index = 0
+    while index < len(tokens):
+        root, index = parse_node(index)
+        roots.append(root)
+    return roots
+
+
+def parse_s1t_text(text: str) -> SExprNode:
+    roots = parse_s1t_roots(text)
+    if len(roots) != 1:
+        raise ORZIPError(f"expected one root block, got {len(roots)}")
+    return roots[0]
 
 
 def parse_scalar_token(token: object, field_type: str, defs_module) -> object:
@@ -796,7 +828,14 @@ def encode_s1t_node(root: SExprNode, defs_module) -> bytes:
         record = bytes([len(label)]) + label_bytes + content
         return int(token_id).to_bytes(2, "little") + (0).to_bytes(2, "little") + len(record).to_bytes(4, "little") + record
 
-    return b"JINX0s1b______\r\n" + encode_node(root)
+    return b"JINX0s1b______" + bytes([13, 10]) + encode_node(root)
+
+
+def encode_s1t_nodes(roots: list[SExprNode], defs_module) -> bytes:
+    encodable_roots = [root for root in roots if root.name.lower() != "max_data"]
+    if not encodable_roots:
+        raise ORZIPError("empty text file")
+    return b"JINX0s1b______" + bytes([13, 10]) + b"".join(encode_s1t_node(root, defs_module)[16:] for root in encodable_roots)
 
 
 def default_output(path: Path, command: str) -> Path:
@@ -914,8 +953,11 @@ def cmd_detect(args: argparse.Namespace) -> int:
         det = detect_bytes(data)
         if args.verify and det.kind == "compressed":
             try:
-                payload = zlib_decompress_container(data)
+                payload = zlib_decompress_container(data, strict_trailing=getattr(args, "strict_zlib", False))
                 print(f"{p}: {det.kind}; declared={det.declared_length}; decompressed={len(payload)}")
+                trailing = zlib_trailing_data_length(data)
+                if trailing:
+                    print(f"  warning: trailing data after zlib stream: {trailing} bytes")
             except ORZIPError as exc:
                 rc = 1
                 print(f"{p}: invalid; {exc}")
@@ -997,8 +1039,8 @@ def cmd_s1t2s1b(args: argparse.Namespace) -> int:
     for p in inputs:
         data = _read(p)
         reject_binary_input_for_compress(p, detect_bytes(data))
-        root = parse_s1t_text(decode_text_auto(data))
-        payload = encode_s1t_node(root, orzip_defs)
+        roots = parse_s1t_roots(decode_text_auto(data))
+        payload = encode_s1t_nodes(roots, orzip_defs)
         data = zlib_compress_container(payload, args.level) if args.compress else payload
         if args.output:
             out = convert_output_path(p, args, suffix)
@@ -1050,8 +1092,8 @@ def cmd_convert(args: argparse.Namespace) -> int:
                 _write(out, output_data, args.force)
             print(f"[convert] {p} -> {out} (binary -> text, {len(output_data)} bytes)")
         elif det.kind in {"unicode-text", "ascii-text-or-binary"}:
-            root = parse_s1t_text(decode_text_auto(data))
-            payload = encode_s1t_node(root, orzip_defs)
+            roots = parse_s1t_roots(decode_text_auto(data))
+            payload = encode_s1t_nodes(roots, orzip_defs)
             output_data = zlib_compress_container(payload, args.level)
             if out.resolve() == p.resolve():
                 atomic_write_in_place(out, output_data, create_backup=not getattr(args, "no_backup", False))
@@ -1073,7 +1115,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             data = _read(p)
             det = detect_bytes(data)
             if det.kind in {"compressed", "raw-binary"}:
-                payload = extract_binary_payload(data)
+                payload = extract_binary_payload(data, strict_trailing=getattr(args, "strict_zlib", False))
                 root = parse_binary_block(payload, 16, orzip_defs.core_token_name)
                 if root is None:
                     raise ORZIPError("could not parse root binary block")
@@ -1085,20 +1127,23 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 if det.declared_length is not None:
                     print(f"  declared payload: {det.declared_length}")
                 print(f"  actual payload: {len(payload)}")
+                trailing = zlib_trailing_data_length(data) if det.kind == "compressed" else 0
+                if trailing:
+                    print(f"  warning: trailing data after zlib stream: {trailing} bytes")
                 print(f"  payload header: {payload[:16].decode('ascii', errors='replace').rstrip()}")
                 print(f"  root block: {root.token_name}")
                 print("  grammar decode: OK")
             elif det.kind in {"unicode-text", "ascii-text-or-binary"}:
                 text = decode_text_auto(data)
-                root = parse_s1t_text(text)
-                if root.name.lower() != "shape":
-                    raise ORZIPError(f"root block must be shape, got {root.name}")
-                payload = encode_s1t_node(root, orzip_defs)
+                roots = parse_s1t_roots(text)
+                if roots[0].name.lower() != "shape":
+                    raise ORZIPError(f"root block must be shape, got {roots[0].name}")
+                payload = encode_s1t_nodes(roots, orzip_defs)
                 print(f"{p.name}: OK")
                 print(f"  kind: {det.kind}")
                 header = text.lstrip("\ufeff").split()[0] if text.strip() else "<empty>"
                 print(f"  text header: {header}")
-                print(f"  root block: {root.name}")
+                print(f"  root block: {roots[0].name}")
                 print("  grammar encode: OK")
                 print(f"  binary payload size: {len(payload)}")
             else:
@@ -1126,8 +1171,8 @@ def cmd_roundtrip(args: argparse.Namespace) -> int:
             if det.kind in {"compressed", "raw-binary"}:
                 original_payload = extract_binary_payload(data)
                 rendered = render_s1t_from_payload(original_payload, orzip_defs)
-                root = parse_s1t_text(rendered)
-                roundtrip_payload = encode_s1t_node(root, orzip_defs)
+                roots = parse_s1t_roots(rendered)
+                roundtrip_payload = encode_s1t_nodes(roots, orzip_defs)
                 digest = hashlib.sha256(original_payload).hexdigest()
                 print(f"{p.name}: OK" if original_payload == roundtrip_payload else f"{p.name}: differs")
                 print("  path: binary -> text -> binary")
@@ -1143,10 +1188,10 @@ def cmd_roundtrip(args: argparse.Namespace) -> int:
                     print(f"  roundtrip sha256: {hashlib.sha256(roundtrip_payload).hexdigest()}")
             elif det.kind in {"unicode-text", "ascii-text-or-binary"}:
                 text = decode_text_auto(data)
-                root = parse_s1t_text(text)
-                payload = encode_s1t_node(root, orzip_defs)
+                roots = parse_s1t_roots(text)
+                payload = encode_s1t_nodes(roots, orzip_defs)
                 regenerated = render_s1t_from_payload(payload, orzip_defs)
-                parse_s1t_text(regenerated)
+                parse_s1t_roots(regenerated)
                 print(f"{p.name}: OK")
                 print("  path: text -> binary -> text")
                 print(f"  binary payload: {len(payload)} bytes")
@@ -1385,7 +1430,7 @@ def build_parser(advanced_help: bool = False) -> argparse.ArgumentParser:
         prog="orzip.py",
         description="Standalone MSTS/Open Rails SIMISA zlib compressor/decompressor for compressed binary .s containers.",
     )
-    parser.add_argument("--version", action="version", version="ORZIP 1.0.3")
+    parser.add_argument("--version", action="version", version="ORZIP 1.0.4")
     parser.add_argument("--advanced-help", action="store_true", help="show all compatibility and technical commands")
     sub = parser.add_subparsers(dest="command", metavar=ADVANCED_COMMANDS if advanced_help else PRIMARY_COMMANDS)
 
@@ -1401,14 +1446,23 @@ def build_parser(advanced_help: bool = False) -> argparse.ArgumentParser:
             help="skip backup for in-place conversion; atomic replacement is still used",
         )
 
+    def add_strict_zlib(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument(
+            "--strict-zlib",
+            action="store_true",
+            help="fail if a compressed SIMISA@F file has bytes after the valid zlib stream",
+        )
+
     p = sub.add_parser("info", help="identify file type")
     add_common(p)
     p.add_argument("-v", "--verify", action="store_true", help="also inflate compressed files and check declared size")
+    add_strict_zlib(p)
     p.set_defaults(func=cmd_detect)
 
     p = sub.add_parser("detect", help="identify file type" if advanced_help else argparse.SUPPRESS)
     add_common(p)
     p.add_argument("-v", "--verify", action="store_true", help="also inflate compressed files and check declared size")
+    add_strict_zlib(p)
     p.set_defaults(func=cmd_detect)
 
     p = sub.add_parser("raw", help="extract raw JINX0... binary payload")
@@ -1507,10 +1561,12 @@ def build_parser(advanced_help: bool = False) -> argparse.ArgumentParser:
 
     p = sub.add_parser("check", help="validate shape files without writing output")
     add_common(p)
+    add_strict_zlib(p)
     p.set_defaults(func=cmd_validate)
 
     p = sub.add_parser("validate", help="validate compressed/raw/text shape files without writing output" if advanced_help else argparse.SUPPRESS)
     add_common(p)
+    add_strict_zlib(p)
     p.set_defaults(func=cmd_validate)
 
     p = sub.add_parser("test", help="test binary/text conversion round-trips without writing output")

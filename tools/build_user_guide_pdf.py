@@ -23,7 +23,7 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 
 class InvariantCanvas(canvas.Canvas):
