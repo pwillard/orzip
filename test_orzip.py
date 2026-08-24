@@ -371,6 +371,14 @@ class ORZIPRegressionTests(unittest.TestCase):
         self.assertIn("point ( 1 2 3 )", rendered)
         self.assertIn("lod_controls (", rendered)
 
+    def test_synthetic_binary_renders_shape_converter_inline_counts(self) -> None:
+        payload = orzip.zlib_decompress_container(SYNTHETIC_COMPRESSED.read_bytes())
+        rendered = orzip.render_s1t_from_payload(payload, orzip_defs)
+
+        self.assertIn("points ( 1\r\n", rendered)
+        self.assertIn("shader_names ( 0 )", rendered)
+        self.assertNotIn("points (\r\n\t\t1", rendered)
+
     @requires_local_samples(DASH8_TEXT)
     def test_dash8_text_compresses_to_valid_binary_container(self) -> None:
         root = orzip.parse_s1t_text(orzip.decode_text_auto(DASH8_TEXT.read_bytes()))

@@ -559,9 +559,18 @@ def render_s1t_from_payload(payload: bytes, defs_module) -> str:
             values = " ".join(value for _, value in entries)
             out.append(f"{prefix} ( {values} )" if values else f"{prefix} ( )")
             return
-        out.append(f"{prefix} (")
+        leading_scalars: list[str] = []
+        remaining_entries = entries
+        while remaining_entries and remaining_entries[0][0] == "scalar":
+            leading_scalars.append(remaining_entries[0][1])
+            remaining_entries = remaining_entries[1:]
+        if leading_scalars:
+            out.append(f"{prefix} ( {' '.join(leading_scalars)}")
+        else:
+            out.append(f"{prefix} (")
+
         scalar_run: list[str] = []
-        for kind, value in entries:
+        for kind, value in remaining_entries:
             if kind == "scalar":
                 scalar_run.append(value)
             else:
@@ -1430,7 +1439,7 @@ def build_parser(advanced_help: bool = False) -> argparse.ArgumentParser:
         prog="orzip.py",
         description="Standalone MSTS/Open Rails SIMISA zlib compressor/decompressor for compressed binary .s containers.",
     )
-    parser.add_argument("--version", action="version", version="ORZIP 1.0.4")
+    parser.add_argument("--version", action="version", version="ORZIP 1.0.5")
     parser.add_argument("--advanced-help", action="store_true", help="show all compatibility and technical commands")
     sub = parser.add_subparsers(dest="command", metavar=ADVANCED_COMMANDS if advanced_help else PRIMARY_COMMANDS)
 

@@ -1,4 +1,4 @@
-# ORZIP 1.0.4
+# ORZIP 1.0.5
 
 ## NOTE: What you probably want is on the *releases* page 
 ---- look over there ---->
@@ -26,4 +26,4 @@ Run `orzip.exe --help` for the concise command list or `orzip.exe --advanced-hel
 
 # NOTE
 
-This update removes some extra functions that likely would never be used and adds extra functionality, such as making backup copies.
+This update fixes a whitespace issue to comply with some parsing issues encountered with legacy 3rd party tools that were more strict about formatting. 

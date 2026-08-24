@@ -1,4 +1,4 @@
-# ORZIP 1.0.4 User Guide
+# ORZIP 1.0.5 User Guide
 
 This guide is for MSTS/Open Rails users who want to check or convert `.s` shape files without needing to understand the internals of the SIMISA file format.
 
