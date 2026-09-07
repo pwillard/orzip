@@ -1,8 +1,8 @@
-# ORZIP 1.0.5 User Guide
+# ORZIP 1.0.9 User Guide
 
-This guide is for MSTS/Open Rails users who want to check or convert `.s` shape files without needing to understand the internals of the SIMISA file format.
+This guide is for MSTS/Open Rails users who want to check or convert `.s`, `.t`, and `.w` files without needing to understand the internals of the SIMISA file format.
 
-ORZIP works with MSTS/Open Rails shape files. It can tell what kind of shape file you have, check whether it can be read, convert between compressed binary and editable text forms, and process whole folders of shape files.
+ORZIP works with MSTS/Open Rails shape, terrain, and world files. It can tell what kind of SIMISA file you have, check whether it can be read, convert between compressed binary and editable text forms, and process whole folders while ignoring unrelated file types.
 
 ## Quick safety advice
 
@@ -23,8 +23,8 @@ Backups are enabled by default. `--no-backup` is an explicit opt-out for users w
 A safe first pass is:
 
 ```text
-orzip.exe check -r -s "C:\MSTS\ROUTES\MyRoute\SHAPES"
-orzip.exe test -r -s "C:\MSTS\ROUTES\MyRoute\SHAPES"
+orzip.exe check -r "C:\MSTS\ROUTES\MyRoute\SHAPES"
+orzip.exe test -r "C:\MSTS\ROUTES\MyRoute\SHAPES"
 ```
 
 Only convert after those checks pass. For important installations, keep an external backup in addition to ORZIP's per-file backups.
@@ -45,6 +45,10 @@ python orzip.py check model.s
 
 The examples below use `orzip.exe`. Replace `orzip.exe` with `python orzip.py` if you are using the Python source version.
 
+## GUI front-end
+
+ORZIP also has a GUI front-end called Open Rails Shape Packer. Use it when you prefer buttons and file/folder pickers instead of typing command-line options. The GUI calls `orzip.exe` underneath, so the same safety rules apply: check/test before bulk conversion, keep backups for important route or trainset folders, and treat `.t` terrain and `.w` world files as binary container files rather than editable text conversions.
+
 ## Common tasks
 
 ### Check a single shape file
@@ -59,10 +63,10 @@ This does not write any output files. For compressed files it also rejects trunc
 
 ### Check every shape file in a folder
 
-Use `-r` to include subfolders. Use `-s/--only-s` so ORZIP only looks at `.s` and `.S` files.
+Use `-r` to include subfolders. ORZIP only looks at `.s`, `.t`, and `.w` files, using a case-insensitive extension check.
 
 ```text
-orzip.exe check -r -s "C:\MSTS\ROUTES\MyRoute\SHAPES"
+orzip.exe check -r "C:\MSTS\ROUTES\MyRoute\SHAPES"
 ```
 
 ### Test whether conversion is safe
@@ -98,6 +102,8 @@ ORZIP detects the current file type and converts it to the other normal form:
 - compressed or raw binary shape data becomes UTF-16 text shape data
 - text shape data becomes compressed binary shape data
 
+Text conversion is supported for `.s` shape files only. `.t` terrain files and `.w` world files stay binary; ORZIP can still inspect and recompress their SIMISA containers with `info`, `check`, `raw`, `wrap`, and `repack`.
+
 By default this is in-place. The same file path is converted atomically and its previous contents are retained in the next available `.bak` file.
 
 ### Convert one file to a separate output file
@@ -119,7 +125,7 @@ orzip.exe convert model.s -o model_converted.s --force
 This is the safer folder-conversion method because your original folder is left alone.
 
 ```text
-orzip.exe convert -r -s "C:\MSTS\ROUTES\MyRoute\SHAPES" -o "C:\MSTS\ROUTES\MyRoute\SHAPES_ORZIP"
+orzip.exe convert -r "C:\MSTS\ROUTES\MyRoute\SHAPES" -o "C:\MSTS\ROUTES\MyRoute\SHAPES_ORZIP"
 ```
 
 ORZIP preserves the relative folder layout under the output folder.
@@ -143,10 +149,10 @@ If an output folder is nested inside a recursively scanned input folder, ORZIP e
 
 ### Convert a folder in place
 
-This converts the `.s` files in the original folder tree and creates a versioned backup beside each converted file.
+This converts the `.s`, `.t`, and `.w` files in the original folder tree and creates a versioned backup beside each converted file.
 
 ```text
-orzip.exe convert -r -s "C:\MSTS\ROUTES\MyRoute\SHAPES"
+orzip.exe convert -r "C:\MSTS\ROUTES\MyRoute\SHAPES"
 ```
 
 ### Restore an in-place backup
@@ -155,7 +161,7 @@ The unnumbered `.bak` file is the oldest ORZIP backup for that source path; late
 
 To restore one, first move the current converted file aside, then copy the chosen backup back to the original filename. For example, restore `model.s.bak.1` as `model.s`. Keep the backup until the restored shape has been checked in Open Rails or MSTS.
 
-Backup files do not have an `.s` suffix, so `-s/--only-s` folder processing does not treat them as shape inputs.
+Backup files do not have `.s`, `.t`, or `.w` suffixes, so folder processing does not treat them as inputs.
 
 ### Convert in place without creating backups
 
@@ -163,7 +169,7 @@ Add `--no-backup` to `convert`, `text`, or `binary` when backup files are not wa
 
 ```text
 orzip.exe convert model.s --no-backup
-orzip.exe convert -r -s Shapes --no-backup
+orzip.exe convert -r Shapes --no-backup
 ```
 
 ORZIP still writes a temporary file and atomically replaces the source, so a preparation or replacement failure leaves the source intact. After a successful replacement, however, the previous contents are not retained. Existing `.bak` files are not deleted or changed by this option.
@@ -206,14 +212,12 @@ orzip.exe check -r "C:\MSTS\ROUTES\MyRoute\SHAPES"
 
 ### `-s/--only-s`
 
-When processing a folder, include only `.s` and `.S` files.
-
-This is usually what you want for MSTS/Open Rails shape folders. Without it, ORZIP will inspect every file in the folder tree.
+This option is kept for old scripts, but it is now a no-op. ORZIP always ignores files except `.s`, `.t`, and `.w`, using a case-insensitive extension check.
 
 Example:
 
 ```text
-orzip.exe check -r -s "C:\MSTS\ROUTES\MyRoute\SHAPES"
+orzip.exe check -r "C:\MSTS\ROUTES\MyRoute\SHAPES"
 ```
 
 ### `-o` or `--output`
@@ -229,7 +233,7 @@ orzip.exe convert model.s -o model_converted.s
 For several explicit input files or a folder, this is the output directory. This applies to `convert`, `text`, and `binary`:
 
 ```text
-orzip.exe convert -r -s Shapes -o ConvertedShapes
+orzip.exe convert -r Shapes -o ConvertedShapes
 orzip.exe text first.s second.s -o ConvertedText
 ```
 
@@ -336,19 +340,19 @@ orzip.exe info --verify model.s
 2. Validate the files:
 
 ```text
-orzip.exe check -r -s "C:\MSTS\ROUTES\MyRoute\SHAPES"
+orzip.exe check -r "C:\MSTS\ROUTES\MyRoute\SHAPES"
 ```
 
 3. Test round-trip conversion:
 
 ```text
-orzip.exe test -r -s "C:\MSTS\ROUTES\MyRoute\SHAPES"
+orzip.exe test -r "C:\MSTS\ROUTES\MyRoute\SHAPES"
 ```
 
 4. Convert to a separate folder first:
 
 ```text
-orzip.exe convert -r -s "C:\MSTS\ROUTES\MyRoute\SHAPES" -o "C:\MSTS\ROUTES\MyRoute\SHAPES_ORZIP"
+orzip.exe convert -r "C:\MSTS\ROUTES\MyRoute\SHAPES" -o "C:\MSTS\ROUTES\MyRoute\SHAPES_ORZIP"
 ```
 
 5. Inspect or test the converted files before replacing originals.

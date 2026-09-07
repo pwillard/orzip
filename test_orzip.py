@@ -280,6 +280,24 @@ class ORZIPRegressionTests(unittest.TestCase):
         self.assertEqual(payload, SYNTHETIC_PAYLOAD)
         self.assertTrue(payload.startswith(b"JINX0s1b______" + bytes([13, 10])))
 
+    def test_detect_uncompressed_wrapped_binary_file(self) -> None:
+        data = orzip.wrap_uncompressed_container(SYNTHETIC_PAYLOAD)
+        detection = orzip.detect_bytes(data)
+
+        self.assertEqual(detection.kind, "uncompressed-binary")
+        self.assertEqual(detection.payload_offset, 16)
+        self.assertEqual(detection.actual_payload_length, len(SYNTHETIC_PAYLOAD))
+        self.assertEqual(orzip.unwrap_uncompressed_container(data), SYNTHETIC_PAYLOAD)
+        self.assertEqual(orzip.extract_binary_payload(data), SYNTHETIC_PAYLOAD)
+
+    def test_detect_uncompressed_wrapped_text_file(self) -> None:
+        payload = b"JINX0s1t______" + bytes([13, 10]) + SYNTHETIC_TEXT_CONTENT.encode("utf-8")
+        data = orzip.wrap_uncompressed_container(payload)
+        detection = orzip.detect_bytes(data)
+
+        self.assertEqual(detection.kind, "uncompressed-text")
+        self.assertIn("SIMISA@@@@@@@@@@JINX0s1t______", orzip.decode_text_auto(data))
+
     def test_decompress_tolerates_bytes_after_zlib_stream_by_default(self) -> None:
         payload = b"JINX0s1b______" + bytes([13, 10])
         container = orzip.zlib_compress_container(payload)
@@ -554,6 +572,33 @@ class ORZIPRegressionTests(unittest.TestCase):
             self.assertEqual(detection.kind, "compressed")
             self.assertEqual(detection.declared_length, len(SYNTHETIC_PAYLOAD))
 
+    def test_cli_text_conversion_commands_reject_binary_only_extensions(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="orzip-binary-only-test-") as td:
+            temp = Path(td)
+            cases = [
+                ("text", temp / "world.w", SYNTHETIC_COMPRESSED),
+                ("convert", temp / "terrain.t", SYNTHETIC_COMPRESSED),
+                ("binary", temp / "terrain-text.t", SYNTHETIC_TEXT),
+            ]
+            for command, source, fixture in cases:
+                with self.subTest(command=command, source=source.name):
+                    output = temp / f"{source.name}.out"
+                    shutil.copy2(fixture, source)
+
+                    result = subprocess.run(
+                        [sys.executable, str(ROOT / "orzip.py"), command, str(source), "-o", str(output)],
+                        cwd=ROOT,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(f"{command} only supports .s shape text conversion", result.stderr)
+                    self.assertIn("files stay binary", result.stderr)
+                    self.assertIn("raw/wrap/repack", result.stderr)
+                    self.assertFalse(output.exists())
+
     def test_cli_binary_multiple_files_writes_to_output_directory(self) -> None:
         with tempfile.TemporaryDirectory(prefix="orzip-multi-output-test-") as td:
             temp = Path(td)
@@ -601,6 +646,94 @@ class ORZIPRegressionTests(unittest.TestCase):
             self.assertEqual(second.read_bytes(), original)
             self.assertIn("SIMISA@@@@@@@@@@JINX0s1t______", orzip.decode_text_auto((output / "first.s.s1t.s").read_bytes()))
             self.assertIn("SIMISA@@@@@@@@@@JINX0s1t______", orzip.decode_text_auto((output / "second.s.s1t.s").read_bytes()))
+
+    def test_cli_uncompress_expands_literal_uppercase_wildcard(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="orzip-wildcard-test-") as td:
+            temp = Path(td)
+            first = temp / "first.s"
+            second = temp / "second.s"
+            shutil.copy2(SYNTHETIC_COMPRESSED, first)
+            shutil.copy2(SYNTHETIC_COMPRESSED, second)
+
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "orzip.py"), "uncompress", "*.S", "--no-backup"],
+                check=True,
+                cwd=temp,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertIn("first.s", result.stdout)
+            self.assertIn("second.s", result.stdout)
+            self.assertIn("SIMISA@@@@@@@@@@JINX0s1t______", orzip.decode_text_auto(first.read_bytes()))
+            self.assertIn("SIMISA@@@@@@@@@@JINX0s1t______", orzip.decode_text_auto(second.read_bytes()))
+            self.assertFalse(first.with_name(first.name + ".bak").exists())
+            self.assertFalse(second.with_name(second.name + ".bak").exists())
+
+    def test_cli_uncompress_accepts_uncompressed_wrapped_binary(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="orzip-unwrapped-test-") as td:
+            temp = Path(td)
+            source = temp / "unwrapped-binary.s"
+            output = temp / "unwrapped-text.s"
+            source.write_bytes(orzip.wrap_uncompressed_container(SYNTHETIC_PAYLOAD))
+
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "orzip.py"), "uncompress", str(source), "-o", str(output)],
+                check=True,
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertIn("unwrapped-binary.s", result.stdout)
+            self.assertIn("SIMISA@@@@@@@@@@JINX0s1t______", orzip.decode_text_auto(output.read_bytes()))
+            self.assertIn("point ( 1 2 3 )", orzip.decode_text_auto(output.read_bytes()))
+
+    def test_cli_repack_converts_uncompressed_wrapped_binary_to_compressed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="orzip-unwrapped-test-") as td:
+            temp = Path(td)
+            source = temp / "unwrapped-binary.s"
+            output = temp / "compressed.s"
+            source.write_bytes(orzip.wrap_uncompressed_container(SYNTHETIC_PAYLOAD))
+
+            subprocess.run(
+                [sys.executable, str(ROOT / "orzip.py"), "repack", str(source), "-o", str(output)],
+                check=True,
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            detection = orzip.detect_bytes(output.read_bytes())
+            self.assertEqual(detection.kind, "compressed")
+            self.assertEqual(detection.declared_length, len(SYNTHETIC_PAYLOAD))
+
+    def test_cli_uncompress_mixed_wildcard_rejects_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="orzip-wildcard-test-") as td:
+            temp = Path(td)
+            compressed = temp / "compressed.s"
+            already_text = temp / "already_text.s"
+            shutil.copy2(SYNTHETIC_COMPRESSED, compressed)
+            shutil.copy2(SYNTHETIC_TEXT, already_text)
+            original_compressed = compressed.read_bytes()
+            original_text = already_text.read_bytes()
+
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "orzip.py"), "uncompress", "*.S"],
+                cwd=temp,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("file is already uncompressed text", result.stderr)
+            self.assertEqual(compressed.read_bytes(), original_compressed)
+            self.assertEqual(already_text.read_bytes(), original_text)
+            self.assertFalse(compressed.with_name(compressed.name + ".bak").exists())
 
     def test_cli_multiple_files_rejects_output_name_collision_before_writing(self) -> None:
         with tempfile.TemporaryDirectory(prefix="orzip-multi-output-test-") as td:
@@ -905,7 +1038,7 @@ class ORZIPRegressionTests(unittest.TestCase):
             self.assertIn("root block: shape", text_result.stdout)
             self.assertIn("grammar encode: OK", text_result.stdout)
 
-    def test_cli_validate_rejects_unsupported_file(self) -> None:
+    def test_cli_validate_ignores_unsupported_file_extension(self) -> None:
         with tempfile.TemporaryDirectory(prefix="orzip-validate-test-") as td:
             bad = Path(td) / "not_shape.txt"
             bad.write_text("not a SIMISA shape file", encoding="utf-8")
@@ -916,8 +1049,8 @@ class ORZIPRegressionTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("unsupported", result.stdout)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
 
     def test_cli_validate_rejects_non_shape_root(self) -> None:
         point_text = "SIMISA@@@@@@@@@@JINX0s1t______\npoint ( 1 2 3 )\n"
@@ -998,6 +1131,32 @@ class ORZIPRegressionTests(unittest.TestCase):
 
             self.assertIn("first.S: OK", result.stdout)
             self.assertIn("second.s: OK", result.stdout)
+            self.assertNotIn("notes.txt", result.stdout)
+
+    def test_cli_validate_processes_only_supported_extensions(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="orzip-folder-test-") as td:
+            temp = Path(td)
+            assets = temp / "Assets"
+            assets.mkdir(parents=True)
+            shutil.copy2(SYNTHETIC_COMPRESSED, assets / "shape.S")
+            shutil.copy2(SYNTHETIC_COMPRESSED, assets / "texture.T")
+            shutil.copy2(SYNTHETIC_COMPRESSED, assets / "world.W")
+            shutil.copy2(SYNTHETIC_COMPRESSED, assets / "ignored.slb")
+            (assets / "notes.txt").write_text("not a shape", encoding="utf-8")
+
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "orzip.py"), "validate", "-r", str(assets)],
+                check=True,
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertIn("shape.S: OK", result.stdout)
+            self.assertIn("texture.T: OK", result.stdout)
+            self.assertIn("world.W: OK", result.stdout)
+            self.assertNotIn("ignored.slb", result.stdout)
             self.assertNotIn("notes.txt", result.stdout)
 
     def test_cli_convert_recursive_only_s_mirrors_output_folder(self) -> None:

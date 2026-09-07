@@ -1,4 +1,4 @@
-# ORZIP 1.0.5
+# ORZIP 1.0.9
 
 ORZIP is a standalone modern Python tool for the MSTS/Open Rails `SIMISA@F` compressed-binary container used by `.s` shape files.
 
@@ -11,7 +11,7 @@ It replaces the old FFEDITC compression wrapper without using `ffeditc_unicode.e
 - Unpack compressed `SIMISA@F` files to raw `JINX0...` binary payloads.
 - Pack raw `JINX0...` binary payloads back into MSTS-compatible `SIMISA@F` compressed files.
 - Normalize/repack existing compressed files with modern zlib.
-- Batch folder processing with `-r` and `.s` filtering with `-s/--only-s`.
+- Batch folder processing with `-r`; ORZIP always ignores files except `.s`, `.t`, and `.w`.
 - Atomic in-place replacement with versioned backups.
 - Mirrored output trees for directory and multiple-file conversion.
 - Preflight protection against output/output, output/input, symlink, and hard-link collisions.
@@ -21,6 +21,7 @@ It replaces the old FFEDITC compression wrapper without using `ffeditc_unicode.e
 - Decode binary `s1b` block contents into grammar-named values with `values`.
 - Export compressed/raw binary `s1b` shape data to UTF-16 textual `s1t` files with `text`.
 - Convert textual `s1t` shape files back to compressed binary `.s` files with `binary`.
+- Reject text conversion commands for `.t` terrain and `.w` world files with a clear binary-only message; use `raw`, `wrap`, or `repack` for their container compression.
 
 ## Important format note
 
@@ -59,8 +60,8 @@ named_shader = 129
 python orzip.py info --verify model.s
 python orzip.py check model.s model_text.s
 python orzip.py test model.s model_text.s
-python orzip.py check -r -s Shapes
-python orzip.py convert -r -s Shapes -o ConvertedShapes
+python orzip.py check -r Shapes
+python orzip.py convert -r Shapes -o ConvertedShapes
 python orzip.py convert model.s
 python orzip.py raw model.s -o model.s1b
 python orzip.py wrap model.s1b -o model_wrapped.s
@@ -124,18 +125,18 @@ Both builders generate through temporary artifacts before replacing the final ou
 
 ## Folder processing
 
-Most commands accept directories as inputs. Use `-r` to recurse and `-s/--only-s` to ignore non-shape files:
+Most commands accept directories as inputs. Use `-r` to recurse. ORZIP only processes files with `.s`, `.t`, or `.w` extensions (`.w` is Open Rails/MSTS world files); every other file is ignored, including explicit file arguments.
 
 ```bash
-python orzip.py check -r -s Shapes
-python orzip.py test -r -s Shapes
-python orzip.py info -r -s --verify Shapes
+python orzip.py check -r Shapes
+python orzip.py test -r Shapes
+python orzip.py info -r --verify Shapes
 ```
 
 Recursive conversion without `-o` converts each `.s` file in place using atomic replacement and a versioned backup. Pass an output directory with `-o` when you want a separate converted tree; ORZIP preserves the relative folder layout:
 
 ```bash
-python orzip.py convert -r -s Shapes -o ConvertedShapes
+python orzip.py convert -r Shapes -o ConvertedShapes
 ```
 
 Example:
@@ -148,7 +149,7 @@ ConvertedShapes/model.S.s1t.s
 ConvertedShapes/Nested/building.s.s1t.s
 ```
 
-Without `-s/--only-s`, recursive commands inspect every file in the folder tree. If the output directory is nested under a recursive input directory, ORZIP excludes that output subtree from input discovery. The output directory cannot be identical to an input directory.
+`-s/--only-s` is still accepted for old scripts, but it is now a no-op because extension filtering is always enabled. If the output directory is nested under a recursive input directory, ORZIP excludes that output subtree from input discovery. The output directory cannot be identical to an input directory.
 
 ## Round-trip checks
 

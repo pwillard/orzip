@@ -16,6 +16,7 @@ Important MSTS distinction:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import os
 import shutil
@@ -27,10 +28,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 COMPRESSED_MAGIC = b"SIMISA@F"
-UNCOMPRESSED_ASCII_MAGIC = b"SIMISA@@"
+UNCOMPRESSED_ASCII_MAGIC = b"SIMISA@@@@@@@@@@"
 UTF16LE_BOM = b"\xff\xfe"
 UTF16LE_SIMISA = UTF16LE_BOM + "SIMISA".encode("utf-16le")
 ZLIB_MAGIC_PREFIXES = {b"\x78\x01", b"\x78\x5e", b"\x78\x9c", b"\x78\xda"}
+ALLOWED_INPUT_SUFFIXES = {".s", ".t", ".w"}
+TEXT_CONVERSION_SUFFIXES = {".s"}
 MAX_S1T_NESTING = 256
 
 
@@ -179,7 +182,14 @@ def detect_bytes(data: bytes) -> Detection:
         return Detection("unicode", "UTF-16LE file beginning with SIMISA")
 
     if data.startswith(UNCOMPRESSED_ASCII_MAGIC):
-        return Detection("ascii-text-or-binary", "uncompressed ASCII SIMISA file")
+        payload_offset = len(UNCOMPRESSED_ASCII_MAGIC)
+        payload = data[payload_offset:]
+        if payload.startswith(b"JINX0"):
+            if len(payload) > 7 and payload[7:8] == b"b":
+                return Detection("uncompressed-binary", "uncompressed wrapped SIMISA binary payload", payload_offset, actual_payload_length=len(payload))
+            if len(payload) > 7 and payload[7:8] == b"t":
+                return Detection("uncompressed-text", "uncompressed wrapped SIMISA text payload", payload_offset, actual_payload_length=len(payload))
+        return Detection("uncompressed-wrapper", "uncompressed SIMISA wrapper", payload_offset, actual_payload_length=len(payload))
 
     if data.startswith(b"JINX0"):
         return Detection("raw-binary", "raw unwrapped SIMISA subfile/payload", actual_payload_length=len(data))
@@ -229,14 +239,29 @@ def zlib_compress_container(payload: bytes, level: int = 9) -> bytes:
     return COMPRESSED_MAGIC + len(payload).to_bytes(4, "little") + b"@@@@" + zlib.compress(payload, level)
 
 
+def unwrap_uncompressed_container(data: bytes) -> bytes:
+    det = detect_bytes(data)
+    if det.kind not in {"uncompressed-binary", "uncompressed-text", "uncompressed-wrapper"} or det.payload_offset is None:
+        raise ORZIPError(det.detail)
+    return data[det.payload_offset:]
+
+
+def wrap_uncompressed_container(payload: bytes) -> bytes:
+    if not payload.startswith(b"JINX0"):
+        raise ORZIPError("raw payload does not start with JINX0; refusing to create a SIMISA uncompressed wrapper")
+    return UNCOMPRESSED_ASCII_MAGIC + payload
+
+
 def extract_binary_payload(data: bytes, *, strict_trailing: bool = False) -> bytes:
     det = detect_bytes(data)
     if det.kind == "compressed":
         payload = zlib_decompress_container(data, strict_trailing=strict_trailing)
+    elif det.kind == "uncompressed-binary":
+        payload = unwrap_uncompressed_container(data)
     elif det.kind == "raw-binary":
         payload = data
     else:
-        raise ORZIPError(f"dump-blocks needs compressed SIMISA@F or raw JINX0 binary data; got {det.kind}")
+        raise ORZIPError(f"need compressed SIMISA@F, uncompressed SIMISA, or raw JINX0 binary data; got {det.kind}")
     if not payload.startswith(b"JINX0"):
         raise ORZIPError("binary payload does not start with JINX0")
     if len(payload) < 16:
@@ -247,15 +272,24 @@ def extract_binary_payload(data: bytes, *, strict_trailing: bool = False) -> byt
 
 
 def reject_text_input_for_uncompress(path: Path, det: Detection) -> None:
-    if det.kind in {"unicode-text", "unicode", "ascii-text-or-binary"}:
+    if det.kind in {"unicode-text", "unicode", "uncompressed-text"}:
         raise ORZIPError(f"cannot uncompress {path}: file is already uncompressed text; use compress for text -> compressed binary")
 
 
 def reject_binary_input_for_compress(path: Path, det: Detection) -> None:
     if det.kind == "compressed":
         raise ORZIPError(f"cannot compress {path}: file is already compressed; use uncompress for compressed binary -> text")
-    if det.kind == "raw-binary":
+    if det.kind in {"raw-binary", "uncompressed-binary"}:
         raise ORZIPError(f"cannot compress {path}: file is already binary s1b data; use pack to wrap raw binary payloads")
+
+
+def reject_non_shape_text_conversion(path: Path, command: str) -> None:
+    if path.suffix.lower() not in TEXT_CONVERSION_SUFFIXES:
+        raise ORZIPError(
+            f"{command} only supports .s shape text conversion; "
+            f"{path.suffix or '<no extension>'} files stay binary. "
+            "Use info/check to inspect them, or raw/wrap/repack for container compression."
+        )
 
 
 def parse_binary_block(payload: bytes, offset: int, token_lookup) -> BinaryBlock | None:
@@ -590,6 +624,8 @@ def render_s1t_from_payload(payload: bytes, defs_module) -> str:
 
 
 def decode_text_auto(data: bytes) -> str:
+    if detect_bytes(data).kind == "uncompressed-text":
+        data = unwrap_uncompressed_container(data)
     if data.startswith(UTF16LE_BOM):
         return data[2:].decode("utf-16le", errors="replace")
     if data.startswith(b"\xfe\xff"):
@@ -860,16 +896,45 @@ def default_output(path: Path, command: str) -> Path:
     raise AssertionError(command)
 
 
+GLOB_CHARS = set("*?[")
+
+
+def expand_input_pattern(path: Path) -> list[Path]:
+    """Expand a literal wildcard argument when the caller's shell did not.
+
+    Windows shells and some launch paths pass patterns such as ``*.S`` through
+    literally.  Handle that inside ORZIP so commands work the same from CMD,
+    PowerShell, Git Bash, and the packaged executable.
+    """
+    text = str(path)
+    if not any(char in text for char in GLOB_CHARS):
+        return [path]
+
+    matches = sorted(path.parent.glob(path.name), key=lambda candidate: candidate.name.lower())
+    if matches or any(part == "**" for part in path.parts):
+        return matches or [path]
+
+    parent = path.parent if str(path.parent) else Path(".")
+    try:
+        insensitive_matches = [
+            candidate
+            for candidate in parent.iterdir()
+            if fnmatch.fnmatchcase(candidate.name.lower(), path.name.lower())
+        ]
+    except OSError:
+        return [path]
+    return sorted(insensitive_matches, key=lambda candidate: candidate.name.lower()) or [path]
+
+
 def iter_inputs(paths: list[Path], recursive: bool, only_s: bool = False) -> list[Path]:
     out: list[Path] = []
-    for p in paths:
+    for p in (expanded for path in paths for expanded in expand_input_pattern(path)):
         if p.is_dir():
             pattern = "**/*" if recursive else "*"
             out.extend(x for x in p.glob(pattern) if x.is_file())
         else:
             out.append(p)
-    if only_s:
-        out = [p for p in out if p.suffix.lower() == ".s"]
+    out = [p for p in out if p.suffix.lower() in ALLOWED_INPUT_SUFFIXES]
     # stable order; de-duplicate without losing order
     seen: set[Path] = set()
     unique: list[Path] = []
@@ -981,7 +1046,13 @@ def cmd_detect(args: argparse.Namespace) -> int:
 def cmd_unpack(args: argparse.Namespace) -> int:
     for p in iter_arg_inputs(args):
         data = _read(p)
-        payload = zlib_decompress_container(data)
+        det = detect_bytes(data)
+        if det.kind == "compressed":
+            payload = zlib_decompress_container(data)
+        elif det.kind in {"uncompressed-binary", "uncompressed-text", "uncompressed-wrapper"}:
+            payload = unwrap_uncompressed_container(data)
+        else:
+            raise ORZIPError(f"raw needs compressed or uncompressed wrapped SIMISA data; got {det.kind}")
         out = args.output if len(args.inputs) == 1 and not p.is_dir() and args.output else default_output(p, "unpack")
         _write(out, payload, args.force)
         print(f"[unpack] {p} -> {out} ({len(payload)} bytes)")
@@ -1000,7 +1071,7 @@ def cmd_pack(args: argparse.Namespace) -> int:
 
 def cmd_normalize(args: argparse.Namespace) -> int:
     for p in iter_arg_inputs(args):
-        payload = zlib_decompress_container(_read(p))
+        payload = extract_binary_payload(_read(p))
         data = zlib_compress_container(payload, args.level)
         out = args.output if len(args.inputs) == 1 and not p.is_dir() and args.output else default_output(p, "normalize")
         _write(out, data, args.force)
@@ -1017,8 +1088,10 @@ def cmd_s1b2s1t(args: argparse.Namespace) -> int:
     inputs = iter_conversion_inputs(args)
     reject_output_collisions(args, inputs, ".s1t.s")
     for p in inputs:
+        reject_non_shape_text_conversion(p, "text")
+        reject_text_input_for_uncompress(p, detect_bytes(_read(p)))
+    for p in inputs:
         data = _read(p)
-        reject_text_input_for_uncompress(p, detect_bytes(data))
         payload = extract_binary_payload(data)
         text = render_s1t_from_payload(payload, orzip_defs)
         output_bytes = UTF16LE_BOM + text.encode("utf-16le")
@@ -1046,6 +1119,7 @@ def cmd_s1t2s1b(args: argparse.Namespace) -> int:
     inputs = iter_conversion_inputs(args)
     reject_output_collisions(args, inputs, suffix)
     for p in inputs:
+        reject_non_shape_text_conversion(p, "binary")
         data = _read(p)
         reject_binary_input_for_compress(p, detect_bytes(data))
         roots = parse_s1t_roots(decode_text_auto(data))
@@ -1077,11 +1151,12 @@ def cmd_convert(args: argparse.Namespace) -> int:
     inputs = iter_conversion_inputs(args)
     plans: list[tuple[Path, bytes, Detection, Path]] = []
     for p in inputs:
+        reject_non_shape_text_conversion(p, "convert")
         data = _read(p)
         det = detect_bytes(data)
-        if det.kind in {"compressed", "raw-binary"}:
+        if det.kind in {"compressed", "uncompressed-binary", "raw-binary"}:
             suffix = ".s1t.s"
-        elif det.kind in {"unicode-text", "ascii-text-or-binary"}:
+        elif det.kind in {"unicode-text", "uncompressed-text"}:
             suffix = ".compressed.s"
         else:
             raise ORZIPError(f"convert cannot auto-convert {p}: {det.detail}")
@@ -1091,7 +1166,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
         reject_planned_output_collisions(inputs, [out for _, _, _, out in plans])
 
     for p, data, det, out in plans:
-        if det.kind in {"compressed", "raw-binary"}:
+        if det.kind in {"compressed", "uncompressed-binary", "raw-binary"}:
             payload = extract_binary_payload(data)
             text = render_s1t_from_payload(payload, orzip_defs)
             output_data = UTF16LE_BOM + text.encode("utf-16le")
@@ -1100,7 +1175,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
             else:
                 _write(out, output_data, args.force)
             print(f"[convert] {p} -> {out} (binary -> text, {len(output_data)} bytes)")
-        elif det.kind in {"unicode-text", "ascii-text-or-binary"}:
+        elif det.kind in {"unicode-text", "uncompressed-text"}:
             roots = parse_s1t_roots(decode_text_auto(data))
             payload = encode_s1t_nodes(roots, orzip_defs)
             output_data = zlib_compress_container(payload, args.level)
@@ -1123,7 +1198,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         try:
             data = _read(p)
             det = detect_bytes(data)
-            if det.kind in {"compressed", "raw-binary"}:
+            if det.kind in {"compressed", "uncompressed-binary", "raw-binary"}:
                 payload = extract_binary_payload(data, strict_trailing=getattr(args, "strict_zlib", False))
                 root = parse_binary_block(payload, 16, orzip_defs.core_token_name)
                 if root is None:
@@ -1142,7 +1217,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 print(f"  payload header: {payload[:16].decode('ascii', errors='replace').rstrip()}")
                 print(f"  root block: {root.token_name}")
                 print("  grammar decode: OK")
-            elif det.kind in {"unicode-text", "ascii-text-or-binary"}:
+            elif det.kind in {"unicode-text", "uncompressed-text"}:
                 text = decode_text_auto(data)
                 roots = parse_s1t_roots(text)
                 if roots[0].name.lower() != "shape":
@@ -1177,7 +1252,7 @@ def cmd_roundtrip(args: argparse.Namespace) -> int:
         try:
             data = _read(p)
             det = detect_bytes(data)
-            if det.kind in {"compressed", "raw-binary"}:
+            if det.kind in {"compressed", "uncompressed-binary", "raw-binary"}:
                 original_payload = extract_binary_payload(data)
                 rendered = render_s1t_from_payload(original_payload, orzip_defs)
                 roots = parse_s1t_roots(rendered)
@@ -1195,7 +1270,7 @@ def cmd_roundtrip(args: argparse.Namespace) -> int:
                     print("  payload match: differs")
                     print(f"  original sha256: {digest}")
                     print(f"  roundtrip sha256: {hashlib.sha256(roundtrip_payload).hexdigest()}")
-            elif det.kind in {"unicode-text", "ascii-text-or-binary"}:
+            elif det.kind in {"unicode-text", "uncompressed-text"}:
                 text = decode_text_auto(data)
                 roots = parse_s1t_roots(text)
                 payload = encode_s1t_nodes(roots, orzip_defs)
@@ -1439,14 +1514,14 @@ def build_parser(advanced_help: bool = False) -> argparse.ArgumentParser:
         prog="orzip.py",
         description="Standalone MSTS/Open Rails SIMISA zlib compressor/decompressor for compressed binary .s containers.",
     )
-    parser.add_argument("--version", action="version", version="ORZIP 1.0.5")
+    parser.add_argument("--version", action="version", version="ORZIP 1.0.9")
     parser.add_argument("--advanced-help", action="store_true", help="show all compatibility and technical commands")
     sub = parser.add_subparsers(dest="command", metavar=ADVANCED_COMMANDS if advanced_help else PRIMARY_COMMANDS)
 
     def add_common(sp: argparse.ArgumentParser) -> None:
         sp.add_argument("inputs", nargs="+", type=Path)
         sp.add_argument("-r", "--recursive", action="store_true", help="recurse into directory inputs")
-        sp.add_argument("-s", "--only-s", action="store_true", help="when processing directories, include only .s/.S files")
+        sp.add_argument("-s", "--only-s", action="store_true", help="deprecated; ORZIP always ignores files except .s/.t/.w")
 
     def add_no_backup(sp: argparse.ArgumentParser) -> None:
         sp.add_argument(
