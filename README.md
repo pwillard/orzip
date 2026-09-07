@@ -26,4 +26,4 @@ Run `orzip.exe --help` for the concise command list or `orzip.exe --advanced-hel
 
 # NOTE
 
-This update fixes a whitespace issue to comply with some parsing issues encountered with legacy 3rd party tools that were more strict about formatting. 
+This update adds support for .T and .W files in addition to the already handled .S files.
