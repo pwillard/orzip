@@ -26,4 +26,5 @@ Run `orzip.exe --help` for the concise command list or `orzip.exe --advanced-hel
 
 # NOTE
 
-This update adds support for .T and .W files in addition to the already handled .S files.
+1.0.9 This update adds support for .T and .W files in addition to the already handled .S files.
+1.0.10 Better handling of in place conversion and the file is read-only
