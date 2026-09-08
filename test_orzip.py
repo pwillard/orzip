@@ -173,6 +173,19 @@ class ORZIPRegressionTests(unittest.TestCase):
             self.assertEqual((Path(td) / "shape.s.bak").read_bytes(), b"first")
             self.assertEqual((Path(td) / "shape.s.bak.1").read_bytes(), b"second")
 
+    def test_atomic_in_place_write_replaces_readonly_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="orzip-atomic-write-test-") as td:
+            target = Path(td) / "shape.s"
+            target.write_bytes(b"original")
+            target.chmod(0o444)
+            try:
+                orzip.atomic_write_in_place(target, b"replacement")
+
+                self.assertEqual(target.read_bytes(), b"replacement")
+                self.assertEqual((Path(td) / "shape.s.bak").read_bytes(), b"original")
+            finally:
+                target.chmod(0o666)
+
     def test_atomic_in_place_write_publishes_backup_with_atomic_replace(self) -> None:
         with tempfile.TemporaryDirectory(prefix="orzip-atomic-write-test-") as td:
             target = Path(td) / "shape.s"

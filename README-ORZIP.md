@@ -1,4 +1,4 @@
-# ORZIP 1.0.9
+# ORZIP 1.0.10
 
 ORZIP is a standalone modern Python tool for the MSTS/Open Rails `SIMISA@F` compressed-binary container used by `.s` shape files.
 

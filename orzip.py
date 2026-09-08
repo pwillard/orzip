@@ -20,6 +20,7 @@ import fnmatch
 import hashlib
 import os
 import shutil
+import stat
 import struct
 import sys
 import tempfile
@@ -98,6 +99,21 @@ def _best_effort_unlink(path: Path | None) -> None:
         pass
 
 
+def _make_path_writable(path: Path) -> None:
+    try:
+        mode = path.stat().st_mode
+        path.chmod(mode | stat.S_IWRITE | stat.S_IREAD)
+    except OSError:
+        pass
+
+
+def _best_effort_chmod(path: Path, mode: int) -> None:
+    try:
+        path.chmod(mode)
+    except OSError:
+        pass
+
+
 def _create_versioned_backup(path: Path) -> Path:
     temp_path: Path | None = None
     try:
@@ -128,6 +144,7 @@ def atomic_write_in_place(path: Path, data: bytes, create_backup: bool = True) -
     if not path.is_file():
         raise ORZIPError(f"cannot replace missing input file: {path}")
 
+    original_mode = path.stat().st_mode
     temp_path: Path | None = None
     backup_path: Path | None = None
     try:
@@ -155,10 +172,13 @@ def atomic_write_in_place(path: Path, data: bytes, create_backup: bool = True) -
             raise ORZIPError(f"cannot back up {path}: {exc}") from exc
 
     try:
+        _make_path_writable(path)
         os.replace(temp_path, path)
     except OSError as exc:
         _best_effort_unlink(temp_path)
         _best_effort_unlink(backup_path)
+        if path.exists():
+            _best_effort_chmod(path, original_mode)
         raise ORZIPError(f"cannot replace {path}: {exc}") from exc
 
 
@@ -1514,7 +1534,7 @@ def build_parser(advanced_help: bool = False) -> argparse.ArgumentParser:
         prog="orzip.py",
         description="Standalone MSTS/Open Rails SIMISA zlib compressor/decompressor for compressed binary .s containers.",
     )
-    parser.add_argument("--version", action="version", version="ORZIP 1.0.9")
+    parser.add_argument("--version", action="version", version="ORZIP 1.0.10")
     parser.add_argument("--advanced-help", action="store_true", help="show all compatibility and technical commands")
     sub = parser.add_subparsers(dest="command", metavar=ADVANCED_COMMANDS if advanced_help else PRIMARY_COMMANDS)
 
